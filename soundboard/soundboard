@@ -14,7 +14,7 @@ logging.basicConfig(level=logging.DEBUG, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
 SOUNDS_DIR = "sounds"
-AUDIO_DEVICE = "hw:2,0"  # HifiBerry DAC (same as mopidy)
+AUDIO_DEVICE = "dmix:CARD=sndrpihifiberry,DEV=0"  # HifiBerry DAC with dmix (allows parallel playback)
 INPUT_DEVICE = "/dev/input/event4"  # 8BitDo controller
 
 # Input event structure format (64-bit Linux)
