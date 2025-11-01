@@ -51,7 +51,7 @@ def play_random_sound():
     logger.info(f"Playing: {os.path.basename(sound_file)}")
 
     # Use mpv to play with dmix for parallel playback alongside mopidy
-    cmd = ["mpv", "--no-video", "--audio-device=" + AUDIO_DEVICE, "--really-quiet", sound_file]
+    cmd = ["mpv", "--no-video", "--audio-device=" + AUDIO_DEVICE, "--volume=50", "--really-quiet", sound_file]
 
     logger.debug(f"Command: {' '.join(cmd)}")
 
