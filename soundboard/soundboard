@@ -38,33 +38,29 @@ def play_random_sound():
     sound_file = random.choice(sound_files)
     logger.info(f"Selected: {sound_file}")
 
-    # Set ALSA device to match mopidy config (hw:2,0 = HifiBerry DAC)
-    env = os.environ.copy()
-    env["AUDIODEV"] = AUDIO_DEVICE
-
-    # Build ffplay command
-    cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error",
-           "-audio_device", AUDIO_DEVICE, sound_file]
+    # Use ffmpeg to play directly to ALSA device (same as mopidy: hw:2,0)
+    cmd = ["ffmpeg", "-i", sound_file, "-f", "alsa", AUDIO_DEVICE]
 
     logger.debug(f"Audio device: {AUDIO_DEVICE}")
     logger.debug(f"Command: {' '.join(cmd)}")
 
-    # Play with ffplay using ALSA device
+    # Play with ffmpeg outputting to ALSA device
     try:
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env
+            stderr=subprocess.PIPE
         )
         logger.info(f"Process started with PID: {process.pid}")
 
-        # Log any immediate errors
-        stderr = process.stderr.read(100)  # Read first 100 bytes
-        if stderr:
-            logger.error(f"ffplay stderr: {stderr.decode('utf-8', errors='ignore')}")
+        # Log any immediate errors (non-blocking check)
+        import select
+        if select.select([process.stderr], [], [], 0.1)[0]:
+            stderr = process.stderr.read(200)
+            if stderr:
+                logger.error(f"ffmpeg stderr: {stderr.decode('utf-8', errors='ignore')}")
     except Exception as e:
-        logger.error(f"Failed to start ffplay: {e}")
+        logger.error(f"Failed to start ffmpeg: {e}")
 
 def main():
     logger.info("Soundboard starting...")
