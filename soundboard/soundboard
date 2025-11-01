@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import glob
+import os
 import random
 import subprocess
 import sys
@@ -8,6 +9,7 @@ import tty
 import termios
 
 SOUNDS_DIR = "sounds"
+AUDIO_DEVICE = "hw:2,0"  # HifiBerry DAC (same as mopidy)
 
 def get_key():
     """Read a single keypress without waiting for Enter"""
@@ -31,11 +33,17 @@ def play_random_sound():
     sound_file = random.choice(sound_files)
     print(f"Playing: {sound_file.split('/')[-1]}")
 
-    # Play with ffplay, hide banner and auto-close when done
+    # Set ALSA device to match mopidy config (hw:2,0 = HifiBerry DAC)
+    env = os.environ.copy()
+    env["AUDIODEV"] = AUDIO_DEVICE
+
+    # Play with ffplay using ALSA device, hide banner and auto-close when done
     subprocess.Popen(
-        ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", sound_file],
+        ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+         "-audio_device", AUDIO_DEVICE, sound_file],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
+        stderr=subprocess.DEVNULL,
+        env=env
     )
 
 def main():
