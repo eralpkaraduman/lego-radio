@@ -104,13 +104,14 @@ def main():
 
                 logger.debug(f"Event: type={ev_type}, code={ev_code}, value={ev_value}")
 
-                # Check for key press (EV_KEY type, value=1 means pressed)
-                if ev_type == EV_KEY and ev_value == 1:
-                    logger.debug(f"Key press detected: code={ev_code}")
+                # Check for key release (EV_KEY type, value=0 means released)
+                # This prevents multiple sounds when holding the button
+                if ev_type == EV_KEY and ev_value == 0:
+                    logger.debug(f"Key release detected: code={ev_code}")
 
                     # A button (KEY_G)
                     if ev_code == KEY_G:
-                        logger.info("A button pressed - playing sound")
+                        logger.info("A button released - playing sound")
                         play_random_sound()
 
     except KeyboardInterrupt:
