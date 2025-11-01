@@ -8,6 +8,7 @@ import sys
 import struct
 import select
 import logging
+import time
 
 # Setup logging
 logging.basicConfig(level=logging.DEBUG, format='[%(levelname)s] %(message)s')
@@ -35,6 +36,11 @@ def read_input_event(device_fd):
         if len(data) == EVENT_SIZE:
             tv_sec, tv_usec, ev_type, ev_code, ev_value = struct.unpack(EVENT_FORMAT, data)
             return ev_type, ev_code, ev_value
+    except OSError as e:
+        # Device disconnected (errno 19 = ENODEV)
+        if e.errno == 19:
+            raise ConnectionError("Input device disconnected")
+        logger.error(f"Error reading input event: {e}")
     except Exception as e:
         logger.error(f"Error reading input event: {e}")
     return None, None, None
@@ -67,6 +73,21 @@ def play_random_sound():
     except Exception as e:
         logger.error(f"Failed to start mpv: {e}")
 
+def open_input_device():
+    """Open the input device, returns file descriptor or None"""
+    try:
+        input_fd = os.open(INPUT_DEVICE, os.O_RDONLY | os.O_NONBLOCK)
+        logger.info(f"Successfully opened {INPUT_DEVICE}")
+        return input_fd
+    except PermissionError:
+        logger.error(f"Permission denied for {INPUT_DEVICE}")
+        logger.error("Run: sudo usermod -a -G input $USER")
+        logger.error("Then log out and back in")
+        return None
+    except FileNotFoundError:
+        logger.warning(f"Device not found: {INPUT_DEVICE}")
+        return None
+
 def main():
     logger.info("Soundboard starting...")
     logger.info(f"Sounds directory: {SOUNDS_DIR}")
@@ -75,50 +96,56 @@ def main():
     logger.info("Using mpv with dmix for parallel playback alongside mopidy")
 
     # Open input device
-    try:
-        input_fd = os.open(INPUT_DEVICE, os.O_RDONLY | os.O_NONBLOCK)
-        logger.info(f"Successfully opened {INPUT_DEVICE}")
-    except PermissionError:
-        logger.error(f"Permission denied for {INPUT_DEVICE}")
-        logger.error("Run: sudo usermod -a -G input $USER")
-        logger.error("Then log out and back in")
-        sys.exit(1)
-    except FileNotFoundError:
-        logger.error(f"Device not found: {INPUT_DEVICE}")
-        logger.error("Make sure the controller is connected")
-        sys.exit(1)
+    input_fd = open_input_device()
+    if input_fd is None:
+        logger.error("Failed to open input device - make sure controller is connected")
+        logger.info("Will keep trying to connect...")
 
     print("Soundboard ready! Press A button on controller to play a random sound.")
     print("Press Ctrl+C to exit.")
 
     try:
         while True:
-            # Wait for input with timeout
-            ready, _, _ = select.select([input_fd], [], [], 0.1)
+            # If device not open, try to open it
+            if input_fd is None:
+                time.sleep(2)
+                input_fd = open_input_device()
+                continue
 
-            if ready:
-                ev_type, ev_code, ev_value = read_input_event(input_fd)
+            try:
+                # Wait for input with timeout
+                ready, _, _ = select.select([input_fd], [], [], 0.1)
 
-                if ev_type is None:
-                    continue
+                if ready:
+                    ev_type, ev_code, ev_value = read_input_event(input_fd)
 
-                logger.debug(f"Event: type={ev_type}, code={ev_code}, value={ev_value}")
+                    if ev_type is None:
+                        continue
 
-                # Check for key release (EV_KEY type, value=0 means released)
-                # This prevents multiple sounds when holding the button
-                if ev_type == EV_KEY and ev_value == 0:
-                    logger.debug(f"Key release detected: code={ev_code}")
+                    logger.debug(f"Event: type={ev_type}, code={ev_code}, value={ev_value}")
 
-                    # A button (KEY_G)
-                    if ev_code == KEY_G:
-                        logger.info("A button released - playing sound")
-                        play_random_sound()
+                    # Check for key release (EV_KEY type, value=0 means released)
+                    # This prevents multiple sounds when holding the button
+                    if ev_type == EV_KEY and ev_value == 0:
+                        logger.debug(f"Key release detected: code={ev_code}")
+
+                        # A button (KEY_G)
+                        if ev_code == KEY_G:
+                            logger.info("A button released - playing sound")
+                            play_random_sound()
+
+            except ConnectionError as e:
+                logger.warning(f"Controller disconnected: {e}")
+                logger.info("Waiting for controller to reconnect...")
+                os.close(input_fd)
+                input_fd = None
 
     except KeyboardInterrupt:
         logger.info("\nShutting down...")
         print("\nGoodbye!")
     finally:
-        os.close(input_fd)
+        if input_fd is not None:
+            os.close(input_fd)
 
 if __name__ == "__main__":
     main()
