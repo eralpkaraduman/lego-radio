@@ -5,8 +5,8 @@ import os
 import random
 import subprocess
 import sys
-import tty
-import termios
+import struct
+import select
 import logging
 
 # Setup logging
@@ -15,17 +15,29 @@ logger = logging.getLogger(__name__)
 
 SOUNDS_DIR = "sounds"
 AUDIO_DEVICE = "hw:2,0"  # HifiBerry DAC (same as mopidy)
+INPUT_DEVICE = "/dev/input/event4"  # 8BitDo controller
 
-def get_key():
-    """Read a single keypress without waiting for Enter"""
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
+# Input event structure format (64-bit Linux)
+# struct input_event { struct timeval time; __u16 type; __u16 code; __s32 value; }
+EVENT_FORMAT = 'llHHi'
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+
+# Event types
+EV_KEY = 1
+
+# Key codes we're interested in
+KEY_G = 34  # A button on controller in K mode
+
+def read_input_event(device_fd):
+    """Read a single input event from the device"""
     try:
-        tty.setraw(fd)
-        key = sys.stdin.read(1)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-    return key
+        data = os.read(device_fd, EVENT_SIZE)
+        if len(data) == EVENT_SIZE:
+            tv_sec, tv_usec, ev_type, ev_code, ev_value = struct.unpack(EVENT_FORMAT, data)
+            return ev_type, ev_code, ev_value
+    except Exception as e:
+        logger.error(f"Error reading input event: {e}")
+    return None, None, None
 
 def play_random_sound():
     """Pick and play a random sound file"""
@@ -36,29 +48,21 @@ def play_random_sound():
         return
 
     sound_file = random.choice(sound_files)
-    logger.info(f"Selected: {sound_file}")
+    logger.info(f"Playing: {os.path.basename(sound_file)}")
 
     # Use ffmpeg to play directly to ALSA device (same as mopidy: hw:2,0)
-    cmd = ["ffmpeg", "-i", sound_file, "-f", "alsa", AUDIO_DEVICE]
+    cmd = ["ffmpeg", "-i", sound_file, "-f", "alsa", AUDIO_DEVICE, "-loglevel", "quiet"]
 
-    logger.debug(f"Audio device: {AUDIO_DEVICE}")
     logger.debug(f"Command: {' '.join(cmd)}")
 
     # Play with ffmpeg outputting to ALSA device
     try:
         process = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE
         )
-        logger.info(f"Process started with PID: {process.pid}")
-
-        # Log any immediate errors (non-blocking check)
-        import select
-        if select.select([process.stderr], [], [], 0.1)[0]:
-            stderr = process.stderr.read(200)
-            if stderr:
-                logger.error(f"ffmpeg stderr: {stderr.decode('utf-8', errors='ignore')}")
+        logger.debug(f"Process started with PID: {process.pid}")
     except Exception as e:
         logger.error(f"Failed to start ffmpeg: {e}")
 
@@ -66,21 +70,52 @@ def main():
     logger.info("Soundboard starting...")
     logger.info(f"Sounds directory: {SOUNDS_DIR}")
     logger.info(f"Audio device: {AUDIO_DEVICE}")
-    print("Soundboard ready! Press A button (g) to play a random sound, press 'q' to exit.")
+    logger.info(f"Input device: {INPUT_DEVICE}")
 
-    while True:
-        key = get_key()
-        logger.debug(f"Key pressed: {repr(key)}")
+    # Open input device
+    try:
+        input_fd = os.open(INPUT_DEVICE, os.O_RDONLY | os.O_NONBLOCK)
+        logger.info(f"Successfully opened {INPUT_DEVICE}")
+    except PermissionError:
+        logger.error(f"Permission denied for {INPUT_DEVICE}")
+        logger.error("Run: sudo usermod -a -G input $USER")
+        logger.error("Then log out and back in")
+        sys.exit(1)
+    except FileNotFoundError:
+        logger.error(f"Device not found: {INPUT_DEVICE}")
+        logger.error("Make sure the controller is connected")
+        sys.exit(1)
 
-        if key == 'g':
-            logger.info("Play sound triggered")
-            play_random_sound()
-        elif key == 'q':
-            logger.info("Quit requested")
-            print("\nGoodbye!")
-            break
-        else:
-            logger.debug(f"Unhandled key: {repr(key)}")
+    print("Soundboard ready! Press A button on controller to play a random sound.")
+    print("Press Ctrl+C to exit.")
+
+    try:
+        while True:
+            # Wait for input with timeout
+            ready, _, _ = select.select([input_fd], [], [], 0.1)
+
+            if ready:
+                ev_type, ev_code, ev_value = read_input_event(input_fd)
+
+                if ev_type is None:
+                    continue
+
+                logger.debug(f"Event: type={ev_type}, code={ev_code}, value={ev_value}")
+
+                # Check for key press (EV_KEY type, value=1 means pressed)
+                if ev_type == EV_KEY and ev_value == 1:
+                    logger.debug(f"Key press detected: code={ev_code}")
+
+                    # A button (KEY_G)
+                    if ev_code == KEY_G:
+                        logger.info("A button pressed - playing sound")
+                        play_random_sound()
+
+    except KeyboardInterrupt:
+        logger.info("\nShutting down...")
+        print("\nGoodbye!")
+    finally:
+        os.close(input_fd)
 
 if __name__ == "__main__":
     main()
