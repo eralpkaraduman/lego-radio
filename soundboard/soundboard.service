@@ -1,0 +1,13 @@
+[Unit]
+Description=Soundboard Service
+After=network.target sound.target
+
+[Service]
+Type=simple
+ExecStart=/home/pi/lego-radio/soundboard/soundboard
+WorkingDirectory=/home/pi/lego-radio/soundboard
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
