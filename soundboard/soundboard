@@ -50,8 +50,8 @@ def play_random_sound():
     sound_file = random.choice(sound_files)
     logger.info(f"Playing: {os.path.basename(sound_file)}")
 
-    # Use ffmpeg to play directly to ALSA device (same as mopidy: hw:2,0)
-    cmd = ["ffmpeg", "-i", sound_file, "-f", "alsa", AUDIO_DEVICE, "-loglevel", "quiet"]
+    # Use ffmpeg to play directly to ALSA device with dmix for parallel playback
+    cmd = ["ffmpeg", "-i", sound_file, "-f", "alsa", AUDIO_DEVICE]
 
     logger.debug(f"Command: {' '.join(cmd)}")
 
@@ -59,10 +59,22 @@ def play_random_sound():
     try:
         process = subprocess.Popen(
             cmd,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
         )
         logger.debug(f"Process started with PID: {process.pid}")
+
+        # Wait a bit and capture output
+        try:
+            stdout, stderr = process.communicate(timeout=0.5)
+            if stdout:
+                logger.debug(f"ffmpeg stdout: {stdout.decode('utf-8', errors='ignore')}")
+            if stderr:
+                logger.info(f"ffmpeg stderr: {stderr.decode('utf-8', errors='ignore')}")
+        except subprocess.TimeoutExpired:
+            # Process is still running, which is good
+            logger.debug("ffmpeg process running in background")
+
     except Exception as e:
         logger.error(f"Failed to start ffmpeg: {e}")
 
