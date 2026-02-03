@@ -109,6 +109,9 @@ impl Player {
         // Duck streams immediately (for macOS say which plays during synthesize)
         self.start_duck();
 
+        // Yield to give stream thread a chance to see duck state before stop() is called
+        thread::yield_now();
+
         let text = text.to_string();
         let tts = tts.clone();
         let stream_handle = self.stream_handle.clone();
@@ -292,14 +295,7 @@ fn stream_audio(
 
     // Decode and play packets
     loop {
-        // Check stop flag
-        if stop_flag.load(Ordering::SeqCst) {
-            debug!("Stream stopped by user");
-            sink.stop();
-            break;
-        }
-
-        // Check duck state and adjust volume
+        // Check duck state FIRST (before stop check) so stream ducks before exiting
         let duck_now = should_duck();
         if is_ducked && !duck_now {
             debug!("Stream unducking");
@@ -309,6 +305,13 @@ fn stream_audio(
             debug!("Stream ducking");
             sink.set_volume(DUCKED_VOLUME);
             is_ducked = true;
+        }
+
+        // Check stop flag after duck state is applied
+        if stop_flag.load(Ordering::SeqCst) {
+            debug!("Stream stopped by user");
+            sink.stop();
+            break;
         }
 
         // Read next packet
