@@ -228,10 +228,10 @@ stateDiagram-v2
 **Platform Differences:**
 | Engine | Audio Output | Synthesis Time | Duck Timing |
 |--------|--------------|----------------|-------------|
-| Piper | rodio (same as stream) | 1-2s on Pi | ⚠️ May expire before audio |
+| Piper | rodio (same as stream) | 1-2s on Pi | ✅ Refreshed after synthesis |
 | macOS `say` | macOS speech system | Immediate | ✅ Works correctly |
 
-Note: When using Piper, synthesis blocks the TTS thread. The duck period (1.5s) may expire before audio plays on slower hardware.
+Duck timer is refreshed after Piper synthesis completes, ensuring the stream stays ducked during TTS playback regardless of synthesis time.
 
 ## Audio Subsystem
 

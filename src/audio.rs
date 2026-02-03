@@ -106,12 +106,14 @@ impl Player {
     pub fn speak(&mut self, text: &str, tts: &std::sync::Arc<crate::tts::PiperTts>) {
         debug!("TTS: {}", text);
 
-        // Duck streams immediately when TTS starts
+        // Duck streams immediately (for macOS say which plays during synthesize)
         self.start_duck();
 
         let text = text.to_string();
         let tts = tts.clone();
         let stream_handle = self.stream_handle.clone();
+        let duck_until_ms = self.duck_until_ms.clone();
+        let boot_time = self.boot_time;
 
         // Spawn TTS in background thread (fire-and-forget)
         thread::spawn(move || {
@@ -119,6 +121,12 @@ impl Player {
                 Ok(samples) => {
                     // Empty samples means audio was already played (e.g., macOS say)
                     if !samples.is_empty() {
+                        // For Piper: refresh duck timer after synthesis completes
+                        // This ensures ducking lasts through playback, not just synthesis
+                        let until = boot_time.elapsed().as_millis() as u64 + DUCK_DURATION_MS;
+                        duck_until_ms.store(until, Ordering::SeqCst);
+                        debug!("Refreshed duck timer after synthesis");
+
                         let samples_f32: Vec<f32> =
                             samples.iter().map(|&s| s as f32 / 32768.0).collect();
                         let source = SamplesBuffer::new(1, 22050, samples_f32);
