@@ -101,8 +101,8 @@ fn run_radio() -> Result<()> {
     info!("Initializing TTS...");
     let tts = std::sync::Arc::new(tts::PiperTts::new()?);
 
-    // Audio player
-    let mut player = audio::Player::new()?;
+    // Multi-stream audio player (all channels playing, one audible)
+    let mut player = audio::MultiStreamPlayer::new()?;
 
     // Channel for button events (input thread -> main thread)
     let (tx, rx) = std::sync::mpsc::channel::<()>();
@@ -123,7 +123,7 @@ fn run_radio() -> Result<()> {
     let mut state = RadioState::Welcome;
     let num_channels = channels::CHANNELS.len();
 
-    // Handle Welcome state on startup (no button press needed)
+    // Handle Welcome state on startup (connects all streams)
     handle_welcome(&mut player, &tts);
 
     loop {
@@ -151,25 +151,32 @@ fn run_radio() -> Result<()> {
                 let channel = &channels::CHANNELS[idx];
                 info!("Channel {}: {}", idx + 1, channel.name);
 
-                // Fire-and-forget TTS, stream starts immediately
+                // Fire-and-forget TTS (ducks all streams), then instant switch
                 player.speak(channel.tts_name, &tts);
+                player.select(idx);  // INSTANT - just volume change
 
-                if let Err(e) = player.play_stream(channel.url) {
-                    error!("Failed to play stream: {}", e);
-                    player.speak_sync("Stream error", &tts);
+                // Check if stream is in error state and needs reconnection
+                if player.active_stream_has_error() {
+                    player.speak_sync("Reconnecting.", &tts);
+
+                    if player.reconnect_active_with_backoff(channel) {
+                        player.speak_sync("Connected.", &tts);
+                    } else {
+                        player.speak_sync("Station unavailable.", &tts);
+                    }
                 }
             }
             RadioState::Off => {
                 info!("Radio OFF");
-                player.stop();
                 player.speak_sync("Radio off", &tts);
+                player.disconnect_all();  // Save bandwidth
             }
         }
     }
 }
 
-/// Handle the Welcome state - greet and check for updates
-fn handle_welcome(player: &mut audio::Player, tts: &std::sync::Arc<tts::PiperTts>) {
+/// Handle the Welcome state - greet, check for updates, connect all streams
+fn handle_welcome(player: &mut audio::MultiStreamPlayer, tts: &std::sync::Arc<tts::PiperTts>) {
     info!("Welcome - checking for updates");
     player.speak_sync("Hello!", tts);
     player.speak_sync("Checking for updates. Please wait.", tts);
@@ -196,6 +203,21 @@ fn handle_welcome(player: &mut audio::Player, tts: &std::sync::Arc<tts::PiperTts
             player.speak_sync("Up to date.", tts);
         }
     }
+
+    // Connect all streams
+    player.speak_sync("Connecting to stations.", tts);
+    let connected = player.connect_all(
+        channels::CHANNELS,
+        std::time::Duration::from_secs(10),
+    );
+
+    // Announce connection status
+    let msg = format!(
+        "Connected {} out of {} stations.",
+        connected,
+        channels::CHANNELS.len()
+    );
+    player.speak_sync(&msg, tts);
 
     player.speak_sync("Change channel to start playing.", tts);
 }

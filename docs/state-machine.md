@@ -5,6 +5,8 @@
 A simple internet radio with 4 channels, controlled by a single button. Press to cycle through:
 `Welcome → Channel 1 → Channel 2 → Channel 3 → Channel 4 → Off → Welcome`
 
+**Multi-Stream Architecture:** All 4 streams connect at boot and play simultaneously (but muted). Channel switching is instant - just a volume change. Off state disconnects all streams to save bandwidth.
+
 ## Main State Flow
 
 ```mermaid
@@ -39,7 +41,9 @@ stateDiagram-v2
 
         Exit --> [*]: process::exit(0)\nsystemd restarts
         UpToDate --> SayUpToDate: "Up to date." (blocking)
-        SayUpToDate --> PromptStart
+        SayUpToDate --> ConnectStreams
+        ConnectStreams --> SayConnected: "Connecting to stations..." (blocking)
+        SayConnected --> PromptStart: "Connected N out of 4 stations."
         PromptStart --> WaitForPress: "Change channel to start playing." (blocking)
         WaitForPress --> [*]
     }
@@ -48,20 +52,17 @@ stateDiagram-v2
 
     state Playing {
         [*] --> DuckAndAnnounce: speak() ducks all streams + TTS
-        DuckAndAnnounce --> StopPrevious: play_stream() calls stop()
-        StopPrevious --> StartStream: Start new stream
+        DuckAndAnnounce --> SelectChannel: select(idx) - instant volume switch
 
-        state StreamLoop {
-            [*] --> CheckDuck: Check duck_until_ms
-            CheckDuck --> Ducked: now < duck_until
-            CheckDuck --> Normal: now >= duck_until
-            Ducked --> DecodeLoop: 10% volume
-            Normal --> DecodeLoop: 80% volume
-            DecodeLoop --> CheckDuck: Loop
+        state AllStreams {
+            [*] --> Stream0: Muted (0.0) or Active (0.8)
+            [*] --> Stream1: Muted (0.0) or Active (0.8)
+            [*] --> Stream2: Muted (0.0) or Active (0.8)
+            [*] --> Stream3: Muted (0.0) or Active (0.8)
         }
 
-        StartStream --> StreamLoop
-        StreamLoop --> [*]: Playing until button press
+        SelectChannel --> AllStreams: Only active stream audible
+        AllStreams --> [*]: Playing until button press
     }
 
     note right of Playing
@@ -70,19 +71,22 @@ stateDiagram-v2
         1. YLE Radio 1
         2. Soma Groove Salad
         3. Soma Drone Zone
+
+        All streams connected,
+        only one audible at a time
     end note
 
-    Playing --> Playing: Button press\n(next channel)
+    Playing --> Playing: Button press\n(next channel)\nINSTANT switch
     Playing --> Off: Button press\n(after channel 3)
 
     state Off {
-        [*] --> StopStream: stop() - waits for thread
-        StopStream --> SayOff: "Radio off" (blocking)
-        SayOff --> Idle
+        [*] --> SayOff: "Radio off" (blocking)
+        SayOff --> DisconnectAll: disconnect_all()
+        DisconnectAll --> Idle: 0 bandwidth, 0 CPU
         Idle --> [*]
     }
 
-    Off --> Welcome: Button press
+    Off --> Welcome: Button press\n(reconnects all streams)
 ```
 
 ## RadioState Enum
@@ -119,7 +123,7 @@ Welcome → Playing(0) → Playing(1) → Playing(2) → Playing(3) → Off → 
 ## Main Loop
 
 ```rust
-// Welcome plays automatically on boot
+// Welcome plays automatically on boot (connects all streams)
 handle_welcome(&mut player, &tts);
 
 loop {
@@ -135,8 +139,14 @@ loop {
     // 4. Execute state action
     match state {
         RadioState::Welcome => handle_welcome(&mut player, &tts),
-        RadioState::Playing(idx) => { /* announce + stream */ },
-        RadioState::Off => { /* stop + announce */ },
+        RadioState::Playing(idx) => {
+            player.speak(channel.tts_name, &tts);  // Duck + announce
+            player.select(idx);                    // INSTANT switch
+        },
+        RadioState::Off => {
+            player.speak_sync("Radio off", &tts);
+            player.disconnect_all();               // Save bandwidth
+        },
     }
 }
 ```
@@ -223,7 +233,7 @@ stateDiagram-v2
 
 **TTS Methods:**
 - `speak_sync()` - Blocking, waits for completion (welcome sequence, "Radio off")
-- `speak()` - Fire-and-forget, spawns thread, **ducks all streams immediately** (channel announcements)
+- `speak()` - Fire-and-forget, spawns thread, **ducks ALL streams immediately** (channel announcements)
 
 **Platform Differences:**
 | Engine | Audio Output | Synthesis Time | Duck Timing |
@@ -231,52 +241,95 @@ stateDiagram-v2
 | Piper | rodio (same as stream) | 1-2s on Pi | ✅ Refreshed after synthesis |
 | macOS `say` | macOS speech system | Immediate | ✅ Works correctly |
 
-Duck timer is refreshed after Piper synthesis completes, ensuring the stream stays ducked during TTS playback regardless of synthesis time.
+Duck timer is refreshed after Piper synthesis completes, ensuring all streams stay ducked during TTS playback regardless of synthesis time.
 
-## Audio Subsystem
+## Audio Subsystem (Multi-Stream)
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Idle
+    [*] --> Disconnected
 
-    state "Stream Playback" as Stream {
-        [*] --> StopExisting: stop() called by play_stream()
-        StopExisting --> HTTPConnect: ureq::get()
-        HTTPConnect --> ProbeFormat: symphonia probe
-        ProbeFormat --> CreateDecoder
-        CreateDecoder --> PlayLoop
-
-        state PlayLoop {
-            [*] --> CheckDuck
-            CheckDuck --> SetDucked: now < duck_until_ms
-            CheckDuck --> SetNormal: now >= duck_until_ms
-            SetDucked --> CheckStop: volume 10%
-            SetNormal --> CheckStop: volume 80%
-            CheckStop --> ReadPacket: !stop_flag
-            CheckStop --> Exit: stop_flag set
-            ReadPacket --> Decode: symphonia
-            Decode --> PlaySamples: rodio sink.append()
-            PlaySamples --> CheckDuck
+    state "Multi-Stream Player" as Player {
+        state Disconnected {
+            [*] --> Idle: No streams, 0 bandwidth
         }
 
-        PlayLoop --> [*]: Stream ends or stopped
-    }
+        state Connected {
+            [*] --> AllPlaying
 
-    Idle --> Stream: play_stream(url)
-    Stream --> Idle: stop() or error
+            state AllPlaying {
+                Stream0: Channel 0 (decode thread)
+                Stream1: Channel 1 (decode thread)
+                Stream2: Channel 2 (decode thread)
+                Stream3: Channel 3 (decode thread)
+            }
+
+            AllPlaying --> VolumeControl: select(idx)
+
+            state VolumeControl {
+                Active: Volume 0.8 (audible)
+                Muted: Volume 0.0 (silent)
+            }
+        }
+
+        Disconnected --> Connected: connect_all()
+        Connected --> Disconnected: disconnect_all()
+    }
 ```
 
-**Stream Ducking (shared timestamp):**
-- `speak()` sets `duck_until_ms = now + 1500ms`
-- ALL streams check this timestamp every decode loop iteration
-- If `now < duck_until_ms`: volume = 10% (ducked)
-- If `now >= duck_until_ms`: volume = 80% (normal)
-- This means ducking affects the **current** stream immediately when TTS starts
+### Connection Phase (Welcome State)
 
-**Stop Behavior:**
-- `stop()` sets `stop_flag` and calls `handle.join()`
-- Waits for stream thread to actually finish before returning
-- Creates new `stop_flag` for next stream
+```rust
+pub fn connect_all(&mut self, channels: &[Channel], timeout: Duration) -> usize {
+    // 1. Spawn 4 threads in parallel
+    // 2. Each thread: HTTP connect + format probe + create decoder
+    // 3. Wait for all with 10 second timeout
+    // 4. Return count of successfully connected streams
+}
+```
+
+All streams start **muted** (volume 0.0). Only when `select(idx)` is called does one become audible.
+
+### Channel Switching (Instant)
+
+```rust
+pub fn select(&mut self, index: usize) {
+    for (i, stream) in self.streams.iter().enumerate() {
+        let volume = if i == index { VOLUME } else { 0.0 };
+        stream.sink.set_volume(volume);
+    }
+    self.active_index = Some(index);
+}
+```
+
+**No HTTP connect, no buffering delay** - just a volume change.
+
+### Stream Ducking (All Streams)
+
+- `speak()` sets `duck_until_ms = now + 1500ms`
+- ALL 4 streams check this timestamp every decode loop iteration
+- Active stream: volume = 10% (ducked) or 80% (normal)
+- Inactive streams: always volume = 0.0 (muted)
+
+### Disconnection (Off State)
+
+```rust
+pub fn disconnect_all(&mut self) {
+    // 1. Set stop_flag for all 4 streams
+    // 2. Wait for all threads to finish
+    // 3. Clear stream handles
+    // Result: 0 bandwidth, 0 CPU
+}
+```
+
+### Error Recovery
+
+When a stream fails mid-playback:
+1. Detect error in decode loop
+2. If active stream: TTS "Reconnecting..."
+3. Spawn reconnect thread with exponential backoff (1s, 2s, 4s)
+4. On success: resume playback
+5. On failure after 3 retries: TTS "Station unavailable"
 
 ## Concurrency Model
 
@@ -298,11 +351,11 @@ flowchart TB
         TX --> BL
     end
 
-    subgraph "Stream Thread (per stream)"
-        STR[Decode packets]
-        STR --> CHK{stop_flag?}
-        CHK -->|No| STR
-        CHK -->|Yes| END[Exit]
+    subgraph "Stream Threads (4 when connected)"
+        STR0[Stream 0: Decode CH0]
+        STR1[Stream 1: Decode CH1]
+        STR2[Stream 2: Decode CH2]
+        STR3[Stream 3: Decode CH3]
     end
 
     subgraph "TTS Thread (fire & forget)"
@@ -312,7 +365,10 @@ flowchart TB
     end
 
     TX -.->|mpsc| WB
-    PC -->|play_stream| STR
+    PC -->|select| STR0
+    PC -->|select| STR1
+    PC -->|select| STR2
+    PC -->|select| STR3
     PC -->|speak| SYN
 ```
 
@@ -321,8 +377,28 @@ flowchart TB
 |--------|----------|---------|
 | Main | Forever | State machine, blocking on rx.recv() |
 | Input | Forever | Debounce button, send to channel |
-| Stream | Per stream | Decode and play audio packets |
+| Stream 0-3 | While connected | Decode and play audio packets (4 threads) |
 | TTS | Per speak() | Synthesize and play announcement |
+
+## Resource Usage
+
+**When Connected (Playing or switching channels):**
+| Resource | Usage |
+|----------|-------|
+| Threads | 6 (main + input + 4 streams) |
+| CPU | ~15-20% on Pi 4 (4 decoders) |
+| Bandwidth | ~512 kbps (4 × 128 kbps) |
+| Memory | ~12-48 MB (thread stacks + decoders) |
+
+**When Disconnected (Off state):**
+| Resource | Usage |
+|----------|-------|
+| Threads | 2 (main + input) |
+| CPU | ~0% |
+| Bandwidth | 0 |
+| Memory | ~2 MB |
+
+**Target Hardware:** Raspberry Pi 4 (2GB+ RAM recommended)
 
 ## Constants
 
@@ -332,6 +408,8 @@ flowchart TB
 | `DUCK_DURATION_MS` | 1500 | audio.rs | How long streams stay ducked |
 | `DUCKED_VOLUME` | 0.1 | audio.rs | Volume during ducking |
 | `VOLUME` | 0.8 | audio.rs | Normal playback volume |
+| `MUTED_VOLUME` | 0.0 | audio.rs | Volume for inactive streams |
+| `CONNECT_TIMEOUT` | 10s | audio.rs | Max time to wait for stream connect |
 
 ## Channels
 
