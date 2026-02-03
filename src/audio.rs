@@ -114,7 +114,7 @@ impl Player {
 
     /// Play an internet radio stream (non-blocking)
     /// Stops any currently playing stream first
-    /// Stream is ducked for first 2 seconds to let TTS announcement be heard
+    /// Stream is ducked briefly to let TTS announcement be heard
     pub fn play_stream(&mut self, url: &str) -> Result<()> {
         info!("Streaming: {}", url);
 
@@ -125,9 +125,12 @@ impl Player {
         let stop_flag = self.stop_flag.clone();
         let stream_handle = self.stream_handle.clone();
 
+        // Start duck timer NOW (before HTTP connect) so TTS plays during connection
+        let duck_start = std::time::Instant::now();
+
         // Spawn a thread to handle streaming
         let handle = thread::spawn(move || {
-            if let Err(e) = stream_audio(&url, &stream_handle, stop_flag) {
+            if let Err(e) = stream_audio(&url, &stream_handle, stop_flag, duck_start) {
                 error!("Stream error: {}", e);
             }
         });
@@ -175,11 +178,12 @@ const DUCKED_VOLUME: f32 = 0.1;
 const DUCK_DURATION_SECS: u64 = 1;
 
 /// Stream audio from URL using symphonia for decoding
-/// Starts ducked for DUCK_DURATION_SECS to let TTS be heard
+/// Starts ducked, unducks after DUCK_DURATION_SECS from duck_start
 fn stream_audio(
     url: &str,
     stream_handle: &OutputStreamHandle,
     stop_flag: Arc<AtomicBool>,
+    duck_start: std::time::Instant,
 ) -> Result<()> {
     // Make HTTP request
     let response = ureq::get(url)
@@ -241,12 +245,20 @@ fn stream_audio(
     // Create a sink for playback - start ducked for TTS announcement
     let sink = Sink::try_new(stream_handle)
         .map_err(|e| anyhow!("Failed to create sink: {}", e))?;
-    sink.set_volume(DUCKED_VOLUME);
-    debug!("Stream starting ducked for {}s", DUCK_DURATION_SECS);
-
-    let start_time = std::time::Instant::now();
     let duck_duration = std::time::Duration::from_secs(DUCK_DURATION_SECS);
-    let mut is_ducked = true;
+    let already_elapsed = duck_start.elapsed();
+    let is_ducked = already_elapsed < duck_duration;
+
+    if is_ducked {
+        sink.set_volume(DUCKED_VOLUME);
+        debug!("Stream starting ducked ({}ms remaining)",
+               (duck_duration - already_elapsed).as_millis());
+    } else {
+        sink.set_volume(VOLUME);
+        debug!("Duck period already elapsed, starting at full volume");
+    }
+
+    let mut is_ducked = is_ducked;
 
     // Decode and play packets
     loop {
@@ -258,8 +270,8 @@ fn stream_audio(
         }
 
         // Unduck after duration elapses
-        if is_ducked && start_time.elapsed() >= duck_duration {
-            debug!("Stream unducking after {}s", DUCK_DURATION_SECS);
+        if is_ducked && duck_start.elapsed() >= duck_duration {
+            debug!("Stream unducking");
             sink.set_volume(VOLUME);
             is_ducked = false;
         }
