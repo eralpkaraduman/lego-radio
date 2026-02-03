@@ -8,8 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// TODO: Update this with your actual GitHub repo
-const GITHUB_REPO: &str = "your-username/lego-radio";
+const GITHUB_REPO: &str = "eralpkaraduman/lego-radio";
 
 #[derive(Deserialize)]
 struct GitHubRelease {

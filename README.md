@@ -57,7 +57,7 @@ Pin layout:
 sudo apt update && sudo apt install -y espeak-ng
 
 # Download lego-radio
-curl -L https://github.com/YOUR_USERNAME/lego-radio/releases/latest/download/lego-radio-arm64 \
+curl -L https://github.com/eralpkaraduman/lego-radio/releases/latest/download/lego-radio-arm64 \
   -o lego-radio
 chmod +x lego-radio
 
