@@ -5,20 +5,35 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+/// TTS engine selection (determined once at boot)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TtsEngine {
+    Piper,
+    #[cfg(target_os = "macos")]
+    MacSay,
+    None,
+}
+
 /// Piper TTS wrapper that downloads and manages the piper binary and voice model
 pub struct PiperTts {
     piper_dir: PathBuf,
     piper_path: PathBuf,
     model_path: PathBuf,
+    /// Which TTS engine to use (checked once at boot)
+    engine: TtsEngine,
 }
 
 impl PiperTts {
     /// Create a new PiperTts instance, downloading required files if needed
+    /// Tests TTS capability once at boot and remembers the result
     pub fn new() -> Result<Self> {
         // Check if piper is installed system-wide (e.g., in Docker)
-        if let Some(tts) = Self::try_system_piper()? {
-            info!("Using system-installed piper");
-            return Ok(tts);
+        if let Some(mut tts) = Self::try_system_piper()? {
+            if tts.test_piper() {
+                info!("Using system-installed piper");
+                tts.engine = TtsEngine::Piper;
+                return Ok(tts);
+            }
         }
 
         // Fall back to downloading piper
@@ -29,10 +44,11 @@ impl PiperTts {
         let piper_path = piper_dir.join(get_piper_binary_name());
         let model_path = data_dir.join("en_US-lessac-medium.onnx");
 
-        let tts = Self {
+        let mut tts = Self {
             piper_dir,
             piper_path,
             model_path,
+            engine: TtsEngine::None,
         };
 
         // Download piper if needed
@@ -45,7 +61,39 @@ impl PiperTts {
             tts.download_voice()?;
         }
 
+        // Test if piper works (check once at boot)
+        if tts.test_piper() {
+            info!("TTS engine: Piper");
+            tts.engine = TtsEngine::Piper;
+        } else {
+            #[cfg(target_os = "macos")]
+            {
+                info!("Piper not working, TTS engine: macOS say");
+                tts.engine = TtsEngine::MacSay;
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                info!("Piper not working, TTS disabled");
+                tts.engine = TtsEngine::None;
+            }
+        }
+
         Ok(tts)
+    }
+
+    /// Test if piper works by synthesizing a short test
+    fn test_piper(&self) -> bool {
+        debug!("Testing Piper TTS...");
+        match self.synthesize_with_piper("test") {
+            Ok(samples) => {
+                debug!("Piper test successful, got {} samples", samples.len());
+                samples.len() > 0
+            }
+            Err(e) => {
+                debug!("Piper test failed: {}", e);
+                false
+            }
+        }
     }
 
     /// Try to use system-installed piper (e.g., in Docker)
@@ -64,6 +112,7 @@ impl PiperTts {
                     piper_dir,
                     piper_path,
                     model_path,
+                    engine: TtsEngine::None,
                 }));
             }
         }
@@ -72,7 +121,18 @@ impl PiperTts {
     }
 
     /// Synthesize text to raw audio samples (16-bit PCM, 22050 Hz, mono)
+    /// Uses the TTS engine determined at boot
     pub fn synthesize(&self, text: &str) -> Result<Vec<i16>> {
+        match self.engine {
+            TtsEngine::Piper => self.synthesize_with_piper(text),
+            #[cfg(target_os = "macos")]
+            TtsEngine::MacSay => self.synthesize_with_say(text),
+            TtsEngine::None => Err(anyhow!("No TTS engine available")),
+        }
+    }
+
+    /// Synthesize using Piper
+    fn synthesize_with_piper(&self, text: &str) -> Result<Vec<i16>> {
         debug!("Piper TTS: {}", text);
 
         let mut cmd = Command::new(&self.piper_path);
@@ -115,6 +175,23 @@ impl PiperTts {
             .collect();
 
         Ok(samples)
+    }
+
+    /// Speak using macOS say command (blocking)
+    #[cfg(target_os = "macos")]
+    fn synthesize_with_say(&self, text: &str) -> Result<Vec<i16>> {
+        debug!("macOS say: {}", text);
+        let status = Command::new("say")
+            .arg(text)
+            .status()
+            .map_err(|e| anyhow!("Failed to run say: {}", e))?;
+
+        if !status.success() {
+            return Err(anyhow!("say command failed"));
+        }
+
+        // Return empty samples - audio was already played by say
+        Ok(vec![])
     }
 
     fn download_piper(&self) -> Result<()> {

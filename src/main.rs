@@ -77,90 +77,96 @@ Channels cycle: 1 → 2 → 3 → ... → OFF → 1 → ...
 fn run_radio() -> Result<()> {
     info!("lego-radio v{} starting", VERSION);
 
-    // Initialize TTS (downloads piper and voice model if needed)
+    // Initialize TTS (downloads piper and voice model if needed, checks capability once)
     info!("Initializing TTS...");
-    let tts = tts::PiperTts::new()?;
+    let tts = std::sync::Arc::new(tts::PiperTts::new()?);
 
     // Audio player
     let mut player = audio::Player::new()?;
 
-    // Button input (GPIO on Pi, keyboard elsewhere)
-    let button = button::create_button();
+    // Channel for button events (input thread -> main thread)
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
 
-    // Start with welcome/update sequence immediately
-    info!("Starting welcome sequence...");
+    // Button input in background thread
+    std::thread::spawn(move || {
+        let button = button::create_button();
+        if !button.is_gpio() {
+            info!("(Press Enter to cycle channels)");
+        }
+        loop {
+            button.wait_for_press();
+            let _ = tx.send(());
+        }
+    });
 
-    // Current channel index
+    // Current channel index (incremented before use)
     // 0 = welcome/update channel (virtual)
     // 1+ = actual radio channels
     // After last channel = off, next press restarts from welcome
-    let mut channel_idx: i32 = 0;
-    let mut first_run = true;
+    let mut channel_idx: i32 = -1; // Will become 0 (welcome) on first iteration
+    let mut pending_press = true; // Start with welcome sequence
 
     loop {
-        // Wait for button press (skip on first run - auto-start)
-        if !first_run {
-            if !button.is_gpio() {
-                info!("(Press Enter to cycle channels)");
+        // Check for button press (non-blocking if stream is playing)
+        if !pending_press {
+            // Block waiting for next press
+            if rx.recv().is_ok() {
+                pending_press = true;
             }
-            button.wait_for_press();
-            channel_idx += 1;
         }
-        first_run = false;
+
+        if !pending_press {
+            continue;
+        }
+
+        // Consume any extra presses that happened during processing
+        while rx.try_recv().is_ok() {}
+
+        pending_press = false;
+        channel_idx += 1;
 
         // Total channels = welcome (1) + radio channels + off state
         let num_radio_channels = channels::CHANNELS.len() as i32;
 
-        if channel_idx == 0 {
-            // Welcome channel - greet and check for updates
+        if channel_idx == 0 || channel_idx > num_radio_channels + 1 {
+            // Welcome channel - greet and check for updates (blocking TTS)
+            channel_idx = 0;
             info!("Welcome channel - checking for updates");
-            player.speak("Hello!", &tts);
-
-            player.speak("Checking for updates. Please wait.", &tts);
+            player.speak_sync("Hello!", &tts);
+            player.speak_sync("Checking for updates. Please wait.", &tts);
 
             match updater::check_for_update() {
                 Some(version) => {
                     info!("Update available: v{}", version);
-                    player.speak("Update found. Installing. This may take a minute.", &tts);
+                    player.speak_sync("Update found. Installing. This may take a minute.", &tts);
 
                     match updater::do_update() {
                         Ok(()) => {
-                            player.speak("Update complete. Restarting now.", &tts);
-                            // Give time for audio to finish
+                            player.speak_sync("Update complete. Restarting now.", &tts);
                             std::thread::sleep(std::time::Duration::from_secs(2));
-                            // Exit - systemd will restart us with new version
                             std::process::exit(0);
                         }
                         Err(e) => {
                             error!("Update failed: {}", e);
-                            player.speak("Update failed. Continuing anyway.", &tts);
+                            player.speak_sync("Update failed. Continuing anyway.", &tts);
                         }
                     }
                 }
                 None => {
                     info!("No updates available");
-                    player.speak("Up to date.", &tts);
+                    player.speak_sync("Up to date.", &tts);
                 }
             }
 
-            // Auto-advance to first radio channel
-            channel_idx = 1;
-            let channel = &channels::CHANNELS[0];
-            info!("Channel 1: {}", channel.name);
-            player.speak(channel.tts_name, &tts);
-
-            if let Err(e) = player.play_stream(channel.url) {
-                error!("Failed to play stream: {}", e);
-                player.speak("Stream error", &tts);
-            }
+            // Stay on welcome channel - user must press to start first radio channel
+            player.speak_sync("Press button to start radio.", &tts);
         } else if channel_idx > num_radio_channels {
             // Past last channel - turn off
-            channel_idx = -1;
             info!("Radio OFF");
             player.stop();
-            player.speak("Radio off", &tts);
+            player.speak_sync("Radio off", &tts);
         } else {
-            // Regular radio channel (1-indexed in channel_idx, 0-indexed in array)
+            // Regular radio channel - fire-and-forget TTS, stream starts immediately
             let channel = &channels::CHANNELS[(channel_idx - 1) as usize];
             info!("Channel {}: {}", channel_idx, channel.name);
 
@@ -169,7 +175,7 @@ fn run_radio() -> Result<()> {
 
             if let Err(e) = player.play_stream(channel.url) {
                 error!("Failed to play stream: {}", e);
-                player.speak("Stream error", &tts);
+                player.speak_sync("Stream error", &tts);
             }
         }
     }
@@ -178,17 +184,18 @@ fn run_radio() -> Result<()> {
 fn test_tts() -> Result<()> {
     println!("Testing TTS (downloading piper if needed)...");
 
-    let tts = tts::PiperTts::new()?;
-    let player = audio::Player::new()?;
+    let tts = std::sync::Arc::new(tts::PiperTts::new()?);
+    let mut player = audio::Player::new()?;
 
     for channel in channels::CHANNELS.iter() {
         println!("  Speaking: {}", channel.tts_name);
         player.speak(channel.tts_name, &tts);
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        // Wait for TTS to complete (fire-and-forget spawns thread)
+        std::thread::sleep(std::time::Duration::from_secs(2));
     }
 
     player.speak("Radio off", &tts);
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::thread::sleep(std::time::Duration::from_secs(2));
 
     println!("TTS test complete!");
     Ok(())
