@@ -312,3 +312,65 @@ fn uninstall_service() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_state_welcome_to_playing() {
+        let state = RadioState::Welcome;
+        assert_eq!(state.next(4), RadioState::Playing(0));
+    }
+
+    #[test]
+    fn test_state_playing_next_channel() {
+        let state = RadioState::Playing(0);
+        assert_eq!(state.next(4), RadioState::Playing(1));
+
+        let state = RadioState::Playing(2);
+        assert_eq!(state.next(4), RadioState::Playing(3));
+    }
+
+    #[test]
+    fn test_state_playing_last_to_off() {
+        let state = RadioState::Playing(3);
+        assert_eq!(state.next(4), RadioState::Off);
+    }
+
+    #[test]
+    fn test_state_off_to_welcome() {
+        let state = RadioState::Off;
+        assert_eq!(state.next(4), RadioState::Welcome);
+    }
+
+    #[test]
+    fn test_state_full_cycle() {
+        let mut state = RadioState::Welcome;
+        let n = 4;
+
+        state = state.next(n); // -> Playing(0)
+        assert_eq!(state, RadioState::Playing(0));
+
+        state = state.next(n); // -> Playing(1)
+        state = state.next(n); // -> Playing(2)
+        state = state.next(n); // -> Playing(3)
+        assert_eq!(state, RadioState::Playing(3));
+
+        state = state.next(n); // -> Off
+        assert_eq!(state, RadioState::Off);
+
+        state = state.next(n); // -> Welcome
+        assert_eq!(state, RadioState::Welcome);
+    }
+
+    #[test]
+    fn test_state_single_channel() {
+        // Edge case: only 1 channel
+        let state = RadioState::Welcome;
+        assert_eq!(state.next(1), RadioState::Playing(0));
+
+        let state = RadioState::Playing(0);
+        assert_eq!(state.next(1), RadioState::Off);
+    }
+}
