@@ -113,30 +113,30 @@ fn run_radio() -> Result<()> {
             info!("Welcome channel - checking for updates");
             player.speak("Hello!", &tts);
 
-            player.speak("Checking for updates", &tts);
+            player.speak("Checking for updates. Please wait.", &tts);
 
             match updater::check_for_update() {
                 Some(version) => {
                     info!("Update available: v{}", version);
-                    player.speak("Update found. Installing.", &tts);
+                    player.speak("Update found. Installing. This may take a minute.", &tts);
 
                     match updater::do_update() {
                         Ok(()) => {
-                            player.speak("Update complete. Restarting.", &tts);
+                            player.speak("Update complete. Restarting now.", &tts);
                             // Give time for audio to finish
-                            std::thread::sleep(std::time::Duration::from_secs(1));
+                            std::thread::sleep(std::time::Duration::from_secs(2));
                             // Exit - systemd will restart us with new version
                             std::process::exit(0);
                         }
                         Err(e) => {
                             error!("Update failed: {}", e);
-                            player.speak("Update failed", &tts);
+                            player.speak("Update failed. Continuing anyway.", &tts);
                         }
                     }
                 }
                 None => {
                     info!("No updates available");
-                    player.speak("No updates", &tts);
+                    player.speak("Up to date.", &tts);
                 }
             }
 
