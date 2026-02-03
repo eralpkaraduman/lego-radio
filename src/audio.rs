@@ -3,9 +3,10 @@ use log::{debug, error, info, warn};
 use rodio::buffer::SamplesBuffer;
 use rodio::{OutputStream, OutputStreamHandle, Sink};
 use std::io::{BufReader, Read};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::formats::FormatOptions;
@@ -16,14 +17,25 @@ use symphonia::core::probe::Hint;
 /// Playback volume (0.0 to 1.0)
 const VOLUME: f32 = 0.8;
 
+/// Volume when ducked for TTS
+const DUCKED_VOLUME: f32 = 0.1;
+
+/// How long to duck streams when TTS plays (in milliseconds)
+const DUCK_DURATION_MS: u64 = 1500;
+
 /// Audio player with fire-and-forget TTS
-/// - Stream plays in background thread, ducks for first 2 seconds
+/// - Stream plays in background thread
+/// - Streams duck when TTS plays (shared duck_until timestamp)
 /// - TTS is non-blocking (fire-and-forget)
 pub struct Player {
     _stream: OutputStream,
     stream_handle: OutputStreamHandle,
     stop_flag: Arc<AtomicBool>,
     stream_thread: Option<JoinHandle<()>>,
+    /// Timestamp (ms since boot_time) until which streams should be ducked
+    duck_until_ms: Arc<AtomicU64>,
+    /// Reference time for calculating timestamps
+    boot_time: Instant,
 }
 
 impl Player {
@@ -36,7 +48,16 @@ impl Player {
             stream_handle,
             stop_flag: Arc::new(AtomicBool::new(false)),
             stream_thread: None,
+            duck_until_ms: Arc::new(AtomicU64::new(0)),
+            boot_time: Instant::now(),
         })
+    }
+
+    /// Start ducking all streams for DUCK_DURATION_MS
+    fn start_duck(&self) {
+        let until = self.boot_time.elapsed().as_millis() as u64 + DUCK_DURATION_MS;
+        self.duck_until_ms.store(until, Ordering::SeqCst);
+        debug!("Ducking streams for {}ms", DUCK_DURATION_MS);
     }
 
     /// Stop any currently playing stream and wait for it to finish
@@ -81,8 +102,12 @@ impl Player {
     }
 
     /// Speak text using TTS (fire-and-forget, non-blocking)
+    /// Ducks any playing streams for DUCK_DURATION_MS
     pub fn speak(&mut self, text: &str, tts: &std::sync::Arc<crate::tts::PiperTts>) {
         debug!("TTS: {}", text);
+
+        // Duck streams immediately when TTS starts
+        self.start_duck();
 
         let text = text.to_string();
         let tts = tts.clone();
@@ -114,7 +139,7 @@ impl Player {
 
     /// Play an internet radio stream (non-blocking)
     /// Stops any currently playing stream first
-    /// Stream is ducked briefly to let TTS announcement be heard
+    /// Stream respects duck_until_ms for ducking during TTS
     pub fn play_stream(&mut self, url: &str) -> Result<()> {
         info!("Streaming: {}", url);
 
@@ -124,13 +149,12 @@ impl Player {
         let url = url.to_string();
         let stop_flag = self.stop_flag.clone();
         let stream_handle = self.stream_handle.clone();
-
-        // Start duck timer NOW (before HTTP connect) so TTS plays during connection
-        let duck_start = std::time::Instant::now();
+        let duck_until_ms = self.duck_until_ms.clone();
+        let boot_time = self.boot_time;
 
         // Spawn a thread to handle streaming
         let handle = thread::spawn(move || {
-            if let Err(e) = stream_audio(&url, &stream_handle, stop_flag, duck_start) {
+            if let Err(e) = stream_audio(&url, &stream_handle, stop_flag, duck_until_ms, boot_time) {
                 error!("Stream error: {}", e);
             }
         });
@@ -171,19 +195,14 @@ impl symphonia::core::io::MediaSource for HttpStreamReader {
     }
 }
 
-/// Volume when stream is ducked (during TTS announcement)
-const DUCKED_VOLUME: f32 = 0.1;
-
-/// How long to duck stream at start (for TTS announcement)
-const DUCK_DURATION_SECS: u64 = 1;
-
 /// Stream audio from URL using symphonia for decoding
-/// Starts ducked, unducks after DUCK_DURATION_SECS from duck_start
+/// Checks duck_until_ms to determine if volume should be ducked
 fn stream_audio(
     url: &str,
     stream_handle: &OutputStreamHandle,
     stop_flag: Arc<AtomicBool>,
-    duck_start: std::time::Instant,
+    duck_until_ms: Arc<AtomicU64>,
+    boot_time: Instant,
 ) -> Result<()> {
     // Make HTTP request
     let response = ureq::get(url)
@@ -242,23 +261,26 @@ fn stream_audio(
 
     info!("Audio: {} Hz, {} channels", sample_rate, channels);
 
-    // Create a sink for playback - start ducked for TTS announcement
+    // Create a sink for playback
     let sink = Sink::try_new(stream_handle)
         .map_err(|e| anyhow!("Failed to create sink: {}", e))?;
-    let duck_duration = std::time::Duration::from_secs(DUCK_DURATION_SECS);
-    let already_elapsed = duck_start.elapsed();
-    let is_ducked = already_elapsed < duck_duration;
 
+    // Helper to check if we should be ducked
+    let should_duck = || {
+        let now_ms = boot_time.elapsed().as_millis() as u64;
+        let until_ms = duck_until_ms.load(Ordering::SeqCst);
+        now_ms < until_ms
+    };
+
+    // Set initial volume based on duck state
+    let mut is_ducked = should_duck();
     if is_ducked {
         sink.set_volume(DUCKED_VOLUME);
-        debug!("Stream starting ducked ({}ms remaining)",
-               (duck_duration - already_elapsed).as_millis());
+        debug!("Stream starting ducked");
     } else {
         sink.set_volume(VOLUME);
-        debug!("Duck period already elapsed, starting at full volume");
+        debug!("Stream starting at full volume");
     }
-
-    let mut is_ducked = is_ducked;
 
     // Decode and play packets
     loop {
@@ -269,11 +291,16 @@ fn stream_audio(
             break;
         }
 
-        // Unduck after duration elapses
-        if is_ducked && duck_start.elapsed() >= duck_duration {
+        // Check duck state and adjust volume
+        let duck_now = should_duck();
+        if is_ducked && !duck_now {
             debug!("Stream unducking");
             sink.set_volume(VOLUME);
             is_ducked = false;
+        } else if !is_ducked && duck_now {
+            debug!("Stream ducking");
+            sink.set_volume(DUCKED_VOLUME);
+            is_ducked = true;
         }
 
         // Read next packet

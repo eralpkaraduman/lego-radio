@@ -53,7 +53,7 @@ stateDiagram-v2
 
         state StreamLoop {
             [*] --> Ducked: 10% volume
-            Ducked --> Normal: After 1 second
+            Ducked --> Normal: After 1.5 seconds
             Normal --> DecodeLoop
             DecodeLoop --> DecodeLoop: Read/decode/play packets
         }
@@ -255,9 +255,10 @@ stateDiagram-v2
 ```
 
 **Stream Ducking:**
-- Streams start at 10% volume (`DUCKED_VOLUME = 0.1`)
-- After 1 second (`DUCK_DURATION_SECS = 2`), volume rises to 80% (`VOLUME = 0.8`)
-- This lets the fire-and-forget TTS announcement be heard
+- When `speak()` is called, ALL streams (current and new) duck to 10% volume
+- Ducking lasts for 1.5 seconds (`DUCK_DURATION_MS = 1500`)
+- After duck period, volume rises to 80% (`VOLUME = 0.8`)
+- Uses shared `duck_until_ms` timestamp so ducking affects any playing stream
 
 **Stop Behavior:**
 - `stop()` sets `stop_flag` and calls `handle.join()`
@@ -315,7 +316,7 @@ flowchart TB
 | Constant | Value | Location | Purpose |
 |----------|-------|----------|---------|
 | `INPUT_DEBOUNCE_MS` | 150 | button.rs | Trailing edge debounce |
-| `DUCK_DURATION_SECS` | 1 | audio.rs | How long stream stays quiet |
+| `DUCK_DURATION_MS` | 1500 | audio.rs | How long streams stay ducked |
 | `DUCKED_VOLUME` | 0.1 | audio.rs | Volume during ducking |
 | `VOLUME` | 0.8 | audio.rs | Normal playback volume |
 
