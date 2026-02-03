@@ -233,15 +233,15 @@ stateDiagram-v2
 
 **TTS Methods:**
 - `speak_sync()` - Blocking, waits for completion (welcome sequence, "Radio off")
-- `speak()` - Fire-and-forget, spawns thread, **ducks ALL streams immediately** (channel announcements)
+- `speak()` - Fire-and-forget, spawns thread, **mutes active stream during playback** (channel announcements)
 
 **Platform Differences:**
-| Engine | Audio Output | Synthesis Time | Duck Timing |
-|--------|--------------|----------------|-------------|
-| Piper | rodio (same as stream) | 1-2s on Pi | ✅ Refreshed after synthesis |
-| macOS `say` | macOS speech system | Immediate | ✅ Works correctly |
+| Engine | Audio Output | Synthesis Time |
+|--------|--------------|----------------|
+| Piper | rodio (same as stream) | 1-2s on Pi |
+| macOS `say` | macOS speech system | Immediate |
 
-Duck timer is refreshed after Piper synthesis completes, ensuring all streams stay ducked during TTS playback regardless of synthesis time.
+Active stream is unmuted after TTS playback completes.
 
 ## Audio Subsystem (Multi-Stream)
 
@@ -304,11 +304,11 @@ pub fn select(&mut self, index: usize) {
 
 **No HTTP connect, no buffering delay** - just a volume change.
 
-### Stream Ducking (All Streams)
+### Stream Muting During TTS
 
-- `speak()` sets `duck_until_ms = now + 1500ms`
-- ALL 4 streams check this timestamp every decode loop iteration
-- Active stream: volume = 10% (ducked) or 80% (normal)
+- `speak()` mutes the active stream (volume 0.0)
+- TTS plays on separate sink at full volume
+- After TTS completes, active stream is unmuted (volume 0.8)
 - Inactive streams: always volume = 0.0 (muted)
 
 ### Disconnection (Off State)
@@ -405,10 +405,8 @@ flowchart TB
 | Constant | Value | Location | Purpose |
 |----------|-------|----------|---------|
 | `INPUT_DEBOUNCE_MS` | 150 | button.rs | Trailing edge debounce |
-| `DUCK_DURATION_MS` | 1500 | audio.rs | How long streams stay ducked |
-| `DUCKED_VOLUME` | 0.1 | audio.rs | Volume during ducking |
 | `VOLUME` | 0.8 | audio.rs | Normal playback volume |
-| `MUTED_VOLUME` | 0.0 | audio.rs | Volume for inactive streams |
+| `MUTED_VOLUME` | 0.0 | audio.rs | Volume for inactive/muted streams |
 | `CONNECT_TIMEOUT` | 10s | audio.rs | Max time to wait for stream connect |
 
 ## Channels
