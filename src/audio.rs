@@ -43,7 +43,7 @@ impl Player {
         self.stop_flag = Arc::new(AtomicBool::new(false));
     }
 
-    /// Speak text using Piper TTS
+    /// Speak text using Piper TTS (falls back to macOS `say` on Mac)
     pub fn speak(&self, text: &str, tts: &crate::tts::PiperTts) {
         debug!("TTS: {}", text);
 
@@ -62,7 +62,15 @@ impl Player {
                 }
             }
             Err(e) => {
-                error!("TTS error: {}", e);
+                warn!("Piper TTS failed: {}", e);
+                // Fallback to macOS say command for testing
+                #[cfg(target_os = "macos")]
+                {
+                    debug!("Falling back to macOS say command");
+                    let _ = std::process::Command::new("say")
+                        .arg(text)
+                        .status();
+                }
             }
         }
     }

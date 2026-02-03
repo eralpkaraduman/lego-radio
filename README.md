@@ -50,11 +50,15 @@ The installer configures I2S audio, installs dependencies, and sets up the servi
 
 ## Usage
 
-Press the button to start:
-1. **First press**: "Hello! Checking for updates..." → auto-updates if available → starts channel 1
-2. **Next presses**: Cycle through channels
-3. **After last channel**: Radio off
-4. **Press again**: Back to step 1
+On power-on, the radio automatically:
+1. Says "Hello! Checking for updates..."
+2. Auto-updates if available
+3. Starts playing channel 1
+
+Then press the button to:
+- Cycle through channels
+- After last channel → radio off
+- Press again → restarts from welcome sequence
 
 ## Commands
 

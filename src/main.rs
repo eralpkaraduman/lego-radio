@@ -87,23 +87,26 @@ fn run_radio() -> Result<()> {
     // Button input (GPIO on Pi, keyboard elsewhere)
     let button = button::create_button();
 
-    info!("Ready. Press button to start...");
-    if !button.is_gpio() {
-        info!("(Press Enter to simulate button press)");
-    }
+    // Start with welcome/update sequence immediately
+    info!("Starting welcome sequence...");
 
     // Current channel index
-    // -1 = off (initial state)
     // 0 = welcome/update channel (virtual)
     // 1+ = actual radio channels
-    let mut channel_idx: i32 = -1;
+    // After last channel = off, next press restarts from welcome
+    let mut channel_idx: i32 = 0;
+    let mut first_run = true;
 
     loop {
-        // Wait for button press
-        button.wait_for_press();
-
-        // Increment channel
-        channel_idx += 1;
+        // Wait for button press (skip on first run - auto-start)
+        if !first_run {
+            if !button.is_gpio() {
+                info!("(Press Enter to cycle channels)");
+            }
+            button.wait_for_press();
+            channel_idx += 1;
+        }
+        first_run = false;
 
         // Total channels = welcome (1) + radio channels + off state
         let num_radio_channels = channels::CHANNELS.len() as i32;
