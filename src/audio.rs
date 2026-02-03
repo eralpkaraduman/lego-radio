@@ -172,7 +172,7 @@ impl symphonia::core::io::MediaSource for HttpStreamReader {
 const DUCKED_VOLUME: f32 = 0.1;
 
 /// How long to duck stream at start (for TTS announcement)
-const DUCK_DURATION_SECS: u64 = 2;
+const DUCK_DURATION_SECS: u64 = 1;
 
 /// Stream audio from URL using symphonia for decoding
 /// Starts ducked for DUCK_DURATION_SECS to let TTS be heard
