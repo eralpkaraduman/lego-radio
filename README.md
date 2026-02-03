@@ -64,16 +64,9 @@ sudo journalctl -u lego-radio -f
 # Restart
 sudo systemctl restart lego-radio
 
-# Set volume (0-100)
-sudo lego-radio --set-volume 50
-sudo systemctl restart lego-radio
-
 # Update to latest version
 sudo lego-radio --update
 sudo systemctl restart lego-radio
-
-# Uninstall
-sudo lego-radio --uninstall
 ```
 
 ## Development

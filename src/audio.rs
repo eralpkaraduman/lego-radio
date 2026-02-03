@@ -13,12 +13,14 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
+/// Playback volume (0.0 to 1.0)
+const VOLUME: f32 = 0.8;
+
 /// Audio player that handles TTS and streaming
 pub struct Player {
     _stream: OutputStream,
     stream_handle: OutputStreamHandle,
     stop_flag: Arc<AtomicBool>,
-    volume: f32,
 }
 
 impl Player {
@@ -30,14 +32,7 @@ impl Player {
             _stream: stream,
             stream_handle,
             stop_flag: Arc::new(AtomicBool::new(false)),
-            volume: 1.0,
         })
-    }
-
-    /// Set playback volume (0.0 to 1.0)
-    pub fn set_volume(&mut self, volume: f32) {
-        self.volume = volume.clamp(0.0, 1.0);
-        info!("Volume set to {}%", (self.volume * 100.0) as i32);
     }
 
 
@@ -61,7 +56,7 @@ impl Player {
                 let source = SamplesBuffer::new(1, 22050, samples_f32);
 
                 if let Ok(sink) = Sink::try_new(&self.stream_handle) {
-                    sink.set_volume(self.volume);
+                    sink.set_volume(VOLUME);
                     sink.append(source);
                     sink.sleep_until_end();
                 }
@@ -83,11 +78,10 @@ impl Player {
         let url = url.to_string();
         let stop_flag = self.stop_flag.clone();
         let stream_handle = self.stream_handle.clone();
-        let volume = self.volume;
 
         // Spawn a thread to handle streaming
         thread::spawn(move || {
-            if let Err(e) = stream_audio(&url, &stream_handle, stop_flag, volume) {
+            if let Err(e) = stream_audio(&url, &stream_handle, stop_flag) {
                 error!("Stream error: {}", e);
             }
         });
@@ -132,7 +126,6 @@ fn stream_audio(
     url: &str,
     stream_handle: &OutputStreamHandle,
     stop_flag: Arc<AtomicBool>,
-    volume: f32,
 ) -> Result<()> {
     // Make HTTP request
     let response = ureq::get(url)
@@ -201,7 +194,7 @@ fn stream_audio(
     // Create a sink for playback
     let sink = Sink::try_new(stream_handle)
         .map_err(|e| anyhow!("Failed to create sink: {}", e))?;
-    sink.set_volume(volume);
+    sink.set_volume(VOLUME);
 
     // Decode and play packets
     loop {

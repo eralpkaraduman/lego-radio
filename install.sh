@@ -73,22 +73,13 @@ apt-get update -qq
 apt-get install -y -qq espeak-ng > /dev/null
 echo -e "${GREEN}  ✓ espeak-ng installed${NC}"
 
-echo -e "${YELLOW}[3/5]${NC} Downloading lego-radio..."
+echo -e "${YELLOW}[3/4]${NC} Downloading lego-radio..."
 DOWNLOAD_URL="https://github.com/eralpkaraduman/lego-radio/releases/latest/download/${BINARY}"
 curl -sL "$DOWNLOAD_URL" -o /usr/local/bin/lego-radio
 chmod +x /usr/local/bin/lego-radio
 echo -e "${GREEN}  ✓ Binary installed to /usr/local/bin/lego-radio${NC}"
 
-echo -e "${YELLOW}[4/5]${NC} Creating config directory..."
-mkdir -p /etc/lego-radio
-# Create default config if not exists
-if [ ! -f /etc/lego-radio/config.json ]; then
-    echo '{"volume": 0.8}' > /etc/lego-radio/config.json
-    echo "  Created default config (volume: 80%)"
-fi
-echo -e "${GREEN}  ✓ Config ready${NC}"
-
-echo -e "${YELLOW}[5/5]${NC} Installing systemd service..."
+echo -e "${YELLOW}[4/4]${NC} Installing systemd service..."
 /usr/local/bin/lego-radio --install
 echo -e "${GREEN}  ✓ Service installed${NC}"
 
