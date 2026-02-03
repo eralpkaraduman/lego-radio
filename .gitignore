@@ -1,0 +1,14 @@
+# Build artifacts
+/target/
+/output/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# macOS
+.DS_Store
+
+# Rust
+Cargo.lock

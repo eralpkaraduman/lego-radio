@@ -1,0 +1,17 @@
+services:
+  dev:
+    build: .
+    platform: linux/arm64
+    volumes:
+      - .:/app
+      - cargo-cache:/usr/local/cargo/registry
+      - target-cache:/app/target
+      - ./output:/output
+    working_dir: /app
+    command: bash
+    stdin_open: true
+    tty: true
+
+volumes:
+  cargo-cache:
+  target-cache:

@@ -1,0 +1,45 @@
+[package]
+name = "lego-radio"
+version = "0.1.0"
+edition = "2021"
+description = "A LEGO-based internet radio with single button control"
+license = "MIT"
+
+[dependencies]
+# Audio decoding (MP3, AAC, FLAC, WAV - pure Rust)
+symphonia = { version = "0.5", features = ["mp3", "aac", "isomp4", "wav", "pcm"] }
+
+# Audio output - use 0.17 to match fliters dependency
+rodio = { version = "0.17", default-features = false, features = ["symphonia-all"] }
+
+# Archive extraction for piper download
+flate2 = "1"
+tar = "0.4"
+
+# HTTP client (blocking, simple)
+ureq = { version = "2", features = ["json"] }
+
+# JSON parsing
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Error handling
+anyhow = "1"
+
+# Terminal input (for testing without GPIO)
+crossterm = "0.28"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# GPIO for Raspberry Pi (only on Linux)
+rppal = "0.19"
+
+[profile.release]
+opt-level = "z"     # Optimize for size
+lto = true          # Link-time optimization
+codegen-units = 1   # Better optimization
+strip = true        # Strip symbols
+panic = "abort"     # Smaller binary
