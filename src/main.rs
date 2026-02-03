@@ -6,8 +6,6 @@ mod updater;
 
 use anyhow::Result;
 use log::{error, info};
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::Arc;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -36,9 +34,6 @@ fn main() -> Result<()> {
         Some("--update") => {
             return updater::do_update();
         }
-        Some("--check") => {
-            return check_update();
-        }
         Some("--test-tts") => {
             return test_tts();
         }
@@ -66,7 +61,6 @@ OPTIONS:
     --install         Install as systemd service
     --uninstall       Remove systemd service
     --update          Download and install latest version
-    --check           Check for updates
     --test-tts        Test text-to-speech
     --test-stream     Test audio streaming [URL]
 
@@ -83,17 +77,9 @@ Channels cycle: 1 → 2 → 3 → ... → OFF → 1 → ...
 fn run_radio() -> Result<()> {
     info!("lego-radio v{} starting", VERSION);
 
-    // Check for updates on startup
-    if let Some(latest) = updater::check_for_update() {
-        info!("Update available: v{} (run --update to install)", latest);
-    }
-
     // Initialize TTS (downloads piper and voice model if needed)
     info!("Initializing TTS...");
     let tts = tts::PiperTts::new()?;
-
-    // Current channel index (-1 = off)
-    let channel_idx = Arc::new(AtomicI32::new(-1));
 
     // Audio player
     let mut player = audio::Player::new()?;
@@ -106,24 +92,74 @@ fn run_radio() -> Result<()> {
         info!("(Press Enter to simulate button press)");
     }
 
+    // Current channel index
+    // -1 = off (initial state)
+    // 0 = welcome/update channel (virtual)
+    // 1+ = actual radio channels
+    let mut channel_idx: i32 = -1;
+
     loop {
         // Wait for button press
         button.wait_for_press();
 
         // Increment channel
-        let idx = channel_idx.fetch_add(1, Ordering::SeqCst) + 1;
-        let num_channels = channels::CHANNELS.len() as i32;
+        channel_idx += 1;
 
-        if idx >= num_channels {
-            // Wrap around to OFF state
-            channel_idx.store(-1, Ordering::SeqCst);
+        // Total channels = welcome (1) + radio channels + off state
+        let num_radio_channels = channels::CHANNELS.len() as i32;
+
+        if channel_idx == 0 {
+            // Welcome channel - greet and check for updates
+            info!("Welcome channel - checking for updates");
+            player.speak("Hello!", &tts);
+
+            player.speak("Checking for updates", &tts);
+
+            match updater::check_for_update() {
+                Some(version) => {
+                    info!("Update available: v{}", version);
+                    player.speak("Update found. Installing.", &tts);
+
+                    match updater::do_update() {
+                        Ok(()) => {
+                            player.speak("Update complete. Restarting.", &tts);
+                            // Give time for audio to finish
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                            // Exit - systemd will restart us with new version
+                            std::process::exit(0);
+                        }
+                        Err(e) => {
+                            error!("Update failed: {}", e);
+                            player.speak("Update failed", &tts);
+                        }
+                    }
+                }
+                None => {
+                    info!("No updates available");
+                    player.speak("No updates", &tts);
+                }
+            }
+
+            // Auto-advance to first radio channel
+            channel_idx = 1;
+            let channel = &channels::CHANNELS[0];
+            info!("Channel 1: {}", channel.name);
+            player.speak(channel.tts_name, &tts);
+
+            if let Err(e) = player.play_stream(channel.url) {
+                error!("Failed to play stream: {}", e);
+                player.speak("Stream error", &tts);
+            }
+        } else if channel_idx > num_radio_channels {
+            // Past last channel - turn off
+            channel_idx = -1;
             info!("Radio OFF");
-
             player.stop();
             player.speak("Radio off", &tts);
         } else {
-            let channel = &channels::CHANNELS[idx as usize];
-            info!("Channel {}: {}", idx + 1, channel.name);
+            // Regular radio channel (1-indexed in channel_idx, 0-indexed in array)
+            let channel = &channels::CHANNELS[(channel_idx - 1) as usize];
+            info!("Channel {}: {}", channel_idx, channel.name);
 
             player.stop();
             player.speak(channel.tts_name, &tts);
@@ -134,19 +170,6 @@ fn run_radio() -> Result<()> {
             }
         }
     }
-}
-
-fn check_update() -> Result<()> {
-    match updater::check_for_update() {
-        Some(v) => {
-            println!("Update available: v{} -> v{}", VERSION, v);
-            println!("Run: lego-radio --update");
-        }
-        None => {
-            println!("Up to date (v{})", VERSION);
-        }
-    }
-    Ok(())
 }
 
 fn test_tts() -> Result<()> {

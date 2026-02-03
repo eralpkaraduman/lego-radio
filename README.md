@@ -50,7 +50,11 @@ The installer configures I2S audio, installs dependencies, and sets up the servi
 
 ## Usage
 
-Press the button to cycle through channels. After the last channel, radio turns off. Press again to restart from channel 1.
+Press the button to start:
+1. **First press**: "Hello! Checking for updates..." → auto-updates if available → starts channel 1
+2. **Next presses**: Cycle through channels
+3. **After last channel**: Radio off
+4. **Press again**: Back to step 1
 
 ## Commands
 
@@ -62,10 +66,6 @@ sudo systemctl status lego-radio
 sudo journalctl -u lego-radio -f
 
 # Restart
-sudo systemctl restart lego-radio
-
-# Update to latest version
-sudo lego-radio --update
 sudo systemctl restart lego-radio
 ```
 
