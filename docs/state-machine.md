@@ -218,12 +218,20 @@ stateDiagram-v2
 1. Try system-installed Piper (`/opt/piper` or `/usr/local/piper`)
 2. Download Piper to `~/.local/share/lego-radio/`
 3. Test Piper with "test" synthesis
-4. Fall back to macOS `say` command if Piper fails
+4. Fall back to macOS `say` command if Piper fails (macOS only)
 5. Store result in `engine` field (no runtime checks)
 
 **TTS Methods:**
 - `speak_sync()` - Blocking, waits for completion (welcome sequence, "Radio off")
 - `speak()` - Fire-and-forget, spawns thread, **ducks all streams immediately** (channel announcements)
+
+**Platform Differences:**
+| Engine | Audio Output | Synthesis Time | Duck Timing |
+|--------|--------------|----------------|-------------|
+| Piper | rodio (same as stream) | 1-2s on Pi | ⚠️ May expire before audio |
+| macOS `say` | macOS speech system | Immediate | ✅ Works correctly |
+
+Note: When using Piper, synthesis blocks the TTS thread. The duck period (1.5s) may expire before audio plays on slower hardware.
 
 ## Audio Subsystem
 
