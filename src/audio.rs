@@ -239,10 +239,6 @@ pub struct MultiStreamPlayer {
     streams: [Option<StreamHandle>; 4],
     /// Currently active (audible) stream index, None = all muted
     active_index: Option<usize>,
-    /// Timestamp (ms since boot_time) until which streams should be ducked
-    duck_until_ms: Arc<AtomicU64>,
-    /// Reference time for calculating timestamps
-    boot_time: Instant,
 }
 
 impl MultiStreamPlayer {
@@ -256,8 +252,6 @@ impl MultiStreamPlayer {
             stream_handle,
             streams: [None, None, None, None],
             active_index: None,
-            duck_until_ms: Arc::new(AtomicU64::new(0)),
-            boot_time: Instant::now(),
         })
     }
 
@@ -270,16 +264,7 @@ impl MultiStreamPlayer {
             if let Some(ref sh) = stream {
                 if let Ok(sink_guard) = sh.sink.lock() {
                     if let Some(ref sink) = *sink_guard {
-                        let volume = if i == index {
-                            // Check if we should be ducked
-                            if self.should_duck() {
-                                DUCKED_VOLUME
-                            } else {
-                                VOLUME
-                            }
-                        } else {
-                            MUTED_VOLUME
-                        };
+                        let volume = if i == index { VOLUME } else { MUTED_VOLUME };
                         sink.set_volume(volume);
                     }
                 }
@@ -288,29 +273,18 @@ impl MultiStreamPlayer {
         self.active_index = Some(index);
     }
 
-    /// Start ducking all streams for DUCK_DURATION_MS
-    fn start_duck(&self) {
-        let until = self.boot_time.elapsed().as_millis() as u64 + DUCK_DURATION_MS;
-        self.duck_until_ms.store(until, Ordering::SeqCst);
-        debug!("Ducking all streams for {}ms", DUCK_DURATION_MS);
-
-        // Apply duck to active stream immediately
+    /// Mute the active stream (for TTS)
+    fn mute_active(&self) {
         if let Some(idx) = self.active_index {
             if let Some(ref sh) = self.streams[idx] {
                 if let Ok(sink_guard) = sh.sink.lock() {
                     if let Some(ref sink) = *sink_guard {
-                        sink.set_volume(DUCKED_VOLUME);
+                        sink.set_volume(MUTED_VOLUME);
+                        debug!("Muted active stream {}", idx);
                     }
                 }
             }
         }
-    }
-
-    /// Check if we should currently be ducked
-    fn should_duck(&self) -> bool {
-        let now_ms = self.boot_time.elapsed().as_millis() as u64;
-        let until_ms = self.duck_until_ms.load(Ordering::SeqCst);
-        now_ms < until_ms
     }
 
     /// Speak text using TTS (blocking, waits for completion)
@@ -339,21 +313,21 @@ impl MultiStreamPlayer {
     }
 
     /// Speak text using TTS (fire-and-forget, non-blocking)
-    /// Ducks ALL playing streams for DUCK_DURATION_MS
+    /// Mutes active stream during TTS, unmutes after
     pub fn speak(&self, text: &str, tts: &std::sync::Arc<crate::tts::PiperTts>) {
         debug!("TTS: {}", text);
 
-        // Duck all streams immediately
-        self.start_duck();
+        // Mute active stream immediately
+        self.mute_active();
 
-        // Yield to give stream threads a chance to see duck state
-        thread::yield_now();
+        // Get reference to active stream's sink for unmuting later
+        let active_sink = self.active_index.and_then(|idx| {
+            self.streams[idx].as_ref().map(|sh| sh.sink.clone())
+        });
 
         let text = text.to_string();
         let tts = tts.clone();
         let stream_handle = self.stream_handle.clone();
-        let duck_until_ms = self.duck_until_ms.clone();
-        let boot_time = self.boot_time;
 
         // Spawn TTS in background thread (fire-and-forget)
         thread::spawn(move || {
@@ -361,11 +335,6 @@ impl MultiStreamPlayer {
                 Ok(samples) => {
                     // Empty samples means audio was already played (e.g., macOS say)
                     if !samples.is_empty() {
-                        // For Piper: refresh duck timer after synthesis completes
-                        let until = boot_time.elapsed().as_millis() as u64 + DUCK_DURATION_MS;
-                        duck_until_ms.store(until, Ordering::SeqCst);
-                        debug!("Refreshed duck timer after synthesis");
-
                         let samples_f32: Vec<f32> =
                             samples.iter().map(|&s| s as f32 / 32768.0).collect();
                         let source = SamplesBuffer::new(1, 22050, samples_f32);
@@ -379,6 +348,16 @@ impl MultiStreamPlayer {
                 }
                 Err(e) => {
                     warn!("TTS failed: {}", e);
+                }
+            }
+
+            // Unmute the stream after TTS completes
+            if let Some(sink_mutex) = active_sink {
+                if let Ok(sink_guard) = sink_mutex.lock() {
+                    if let Some(ref sink) = *sink_guard {
+                        sink.set_volume(VOLUME);
+                        debug!("Unmuted stream after TTS");
+                    }
                 }
             }
         });
@@ -409,12 +388,10 @@ impl MultiStreamPlayer {
             let tx = tx.clone();
             let url = channel.url.to_string();
             let stream_handle = self.stream_handle.clone();
-            let duck_until_ms = self.duck_until_ms.clone();
-            let boot_time = self.boot_time;
 
             thread::spawn(move || {
                 debug!("Connecting stream {}: {}", i, url);
-                let result = connect_single_stream(i, &url, stream_handle, duck_until_ms, boot_time);
+                let result = connect_single_stream(i, &url, stream_handle);
                 let _ = tx.send((i, result));
             });
         }
@@ -499,19 +476,13 @@ impl MultiStreamPlayer {
         }
 
         // Try to reconnect
-        match connect_single_stream(
-            index,
-            channel.url,
-            self.stream_handle.clone(),
-            self.duck_until_ms.clone(),
-            self.boot_time,
-        ) {
+        match connect_single_stream(index, channel.url, self.stream_handle.clone()) {
             Ok(handle) => {
                 // Set volume based on whether this is the active stream
                 if let Ok(sink_guard) = handle.sink.lock() {
                     if let Some(ref sink) = *sink_guard {
                         let volume = if self.active_index == Some(index) {
-                            if self.should_duck() { DUCKED_VOLUME } else { VOLUME }
+                            VOLUME
                         } else {
                             MUTED_VOLUME
                         };
@@ -558,8 +529,6 @@ fn connect_single_stream(
     index: usize,
     url: &str,
     stream_handle: OutputStreamHandle,
-    _duck_until_ms: Arc<AtomicU64>,  // Reserved for future duck support in multi-stream
-    _boot_time: Instant,              // Reserved for future duck support in multi-stream
 ) -> Result<StreamHandle> {
     // Make HTTP request
     let response = ureq::get(url)
