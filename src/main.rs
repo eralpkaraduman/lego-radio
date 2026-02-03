@@ -206,7 +206,7 @@ fn handle_welcome(player: &mut audio::MultiStreamPlayer, tts: &std::sync::Arc<tt
     }
 
     // Connect all streams
-    player.speak_sync("Connecting to stations.", tts);
+    player.speak_sync("Connecting to stations. Please wait.", tts);
     let connected = player.connect_all(
         channels::CHANNELS,
         std::time::Duration::from_secs(10),
