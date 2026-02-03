@@ -1,6 +1,7 @@
 mod audio;
 mod button;
 mod channels;
+mod config;
 mod tts;
 mod updater;
 
@@ -46,6 +47,16 @@ fn main() -> Result<()> {
             let url = args.get(2).map(|s| s.as_str()).unwrap_or(channels::CHANNELS[0].url);
             return test_stream(url);
         }
+        Some("--set-volume") => {
+            let volume = args
+                .get(2)
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(80.0);
+            return set_volume(volume);
+        }
+        Some("--get-volume") => {
+            return get_volume();
+        }
         _ => {}
     }
 
@@ -69,6 +80,8 @@ OPTIONS:
     --check           Check for updates
     --test-tts        Test text-to-speech
     --test-stream     Test audio streaming [URL]
+    --set-volume N    Set volume (0-100)
+    --get-volume      Show current volume
 
 CONTROLS:
     On Raspberry Pi: Press the GPIO button to cycle channels
@@ -83,6 +96,10 @@ Channels cycle: 1 → 2 → 3 → ... → OFF → 1 → ...
 fn run_radio() -> Result<()> {
     info!("lego-radio v{} starting", VERSION);
 
+    // Load config
+    let cfg = config::Config::load();
+    info!("Volume: {}%", (cfg.volume * 100.0) as i32);
+
     // Check for updates on startup
     if let Some(latest) = updater::check_for_update() {
         info!("Update available: v{} (run --update to install)", latest);
@@ -95,8 +112,9 @@ fn run_radio() -> Result<()> {
     // Current channel index (-1 = off)
     let channel_idx = Arc::new(AtomicI32::new(-1));
 
-    // Audio player
+    // Audio player with configured volume
     let mut player = audio::Player::new()?;
+    player.set_volume(cfg.volume);
 
     // Button input (GPIO on Pi, keyboard elsewhere)
     let button = button::create_button();
@@ -226,6 +244,21 @@ WantedBy=multi-user.target
         println!("Service installation only supported on Linux");
     }
 
+    Ok(())
+}
+
+fn set_volume(percent: f32) -> Result<()> {
+    let mut cfg = config::Config::load();
+    cfg.set_volume(percent / 100.0);
+    cfg.save()?;
+    println!("Volume set to {}%", (cfg.volume * 100.0) as i32);
+    println!("Restart the service to apply: sudo systemctl restart lego-radio");
+    Ok(())
+}
+
+fn get_volume() -> Result<()> {
+    let cfg = config::Config::load();
+    println!("{}%", (cfg.volume * 100.0) as i32);
     Ok(())
 }
 

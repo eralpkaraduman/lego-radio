@@ -1,6 +1,6 @@
 [package]
 name = "lego-radio"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A LEGO-based internet radio with single button control"
 license = "MIT"

@@ -15,8 +15,9 @@ A LEGO-based internet radio with single button control, powered by Raspberry Pi.
 ### Requirements
 
 - Raspberry Pi 4 (or 3B+)
+- [Audio Amp SHIM](https://shop.pimoroni.com/products/audio-amp-shim-3w-mono-amp) (3W mono I2S amp)
 - Momentary push button
-- Speaker (3.5mm or USB audio)
+- 4-8Ω speaker (3W or less)
 - Power supply
 
 ### Wiring
@@ -50,7 +51,21 @@ Pin layout:
 - 64-bit is required for the TTS engine
 - Desktop environment not needed
 
-### Installation
+### Quick Install
+
+```bash
+# Download and run the installer (configures audio + installs everything)
+curl -sL https://raw.githubusercontent.com/eralpkaraduman/lego-radio/main/install.sh | sudo bash
+```
+
+The installer will:
+- Configure I2S audio for Audio Amp SHIM
+- Install espeak-ng (required for TTS)
+- Download lego-radio binary
+- Set up systemd service
+- Prompt for reboot (required for audio)
+
+### Manual Installation
 
 ```bash
 # Install espeak-ng (required for TTS)
@@ -70,6 +85,22 @@ chmod +x lego-radio
 # Install as system service
 sudo mv lego-radio /usr/local/bin/
 sudo /usr/local/bin/lego-radio --install
+```
+
+### Audio Amp SHIM Setup
+
+If not using the installer, manually configure I2S audio:
+
+```bash
+# Add to /boot/firmware/config.txt (or /boot/config.txt on older OS):
+dtoverlay=hifiberry-dac
+gpio=25=op,dh
+
+# Comment out onboard audio:
+#dtparam=audio=on
+
+# Reboot required
+sudo reboot
 ```
 
 ### Service Management
@@ -119,6 +150,21 @@ Options:
   --check           Check for updates
   --test-tts        Test text-to-speech
   --test-stream     Test audio streaming [URL]
+  --set-volume N    Set volume (0-100)
+  --get-volume      Show current volume
+```
+
+## Volume Control
+
+Volume is stored in `/etc/lego-radio/config.json` and persists across restarts.
+
+```bash
+# Set volume to 50%
+sudo lego-radio --set-volume 50
+sudo systemctl restart lego-radio
+
+# Check current volume
+lego-radio --get-volume
 ```
 
 ## Updating
