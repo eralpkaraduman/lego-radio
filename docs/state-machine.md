@@ -1,5 +1,10 @@
 # LEGO Radio State Machine
 
+## Overview
+
+A simple internet radio with 4 channels, controlled by a single button. Press to cycle through:
+`Welcome → Channel 1 → Channel 2 → Channel 3 → Channel 4 → Off → Welcome`
+
 ## Main State Flow
 
 ```mermaid
@@ -8,17 +13,18 @@ stateDiagram-v2
 
     state Boot {
         [*] --> InitLogger
-        InitLogger --> InitTTS
-        InitTTS --> InitAudio
-        InitAudio --> SpawnInputThread
+        InitLogger --> InitTTS: Downloads Piper if needed
+        InitTTS --> InitAudio: Creates rodio output
+        InitAudio --> SpawnInputThread: mpsc channel created
         SpawnInputThread --> [*]
     }
 
-    Boot --> Welcome: Auto (handle_welcome called)
+    Boot --> Welcome: Auto (no button press)
 
     state Welcome {
-        [*] --> SayHello: "Hello!"
-        SayHello --> CheckUpdates: "Checking for updates..."
+        [*] --> SayHello: "Hello!" (blocking)
+        SayHello --> SayCheckingUpdates: "Checking for updates..." (blocking)
+        SayCheckingUpdates --> CheckUpdates
 
         state UpdateCheck <<choice>>
         CheckUpdates --> UpdateCheck
@@ -32,20 +38,21 @@ stateDiagram-v2
         InstallResult --> PromptStart: Failure
 
         Exit --> [*]: process::exit(0)\nsystemd restarts
-        UpToDate --> PromptStart: "Up to date"
-        PromptStart --> WaitForPress: "Press button to start"
+        UpToDate --> SayUpToDate: "Up to date." (blocking)
+        SayUpToDate --> PromptStart
+        PromptStart --> WaitForPress: "Press button to start." (blocking)
         WaitForPress --> [*]
     }
 
-    Welcome --> Playing: Button press
+    Welcome --> Playing: Button press → state.next()
 
     state Playing {
-        [*] --> StopPrevious: stop() if streaming
+        [*] --> StopPrevious: play_stream() calls stop() internally
         StopPrevious --> AnnounceChannel: speak() fire-and-forget
         AnnounceChannel --> StartStream: play_stream()
 
         state StreamLoop {
-            [*] --> Ducked: Volume 10%
+            [*] --> Ducked: 10% volume
             Ducked --> Normal: After 2 seconds
             Normal --> DecodeLoop
             DecodeLoop --> DecodeLoop: Read/decode/play packets
@@ -56,19 +63,19 @@ stateDiagram-v2
     }
 
     note right of Playing
-        Channels 1-4:
-        1. YLE Classical
-        2. YLE Radio 1
-        3. Soma Groove Salad
-        4. Soma Drone Zone
+        4 Channels (index 0-3):
+        0. YLE Classical
+        1. YLE Radio 1
+        2. Soma Groove Salad
+        3. Soma Drone Zone
     end note
 
     Playing --> Playing: Button press\n(next channel)
-    Playing --> Off: Button press\n(after last channel)
+    Playing --> Off: Button press\n(after channel 3)
 
     state Off {
-        [*] --> StopStream: stop()
-        StopStream --> SayOff: "Radio off"
+        [*] --> StopStream: stop() - waits for thread
+        StopStream --> SayOff: "Radio off" (blocking)
         SayOff --> Idle
         Idle --> [*]
     }
@@ -76,37 +83,63 @@ stateDiagram-v2
     Off --> Welcome: Button press
 ```
 
-## State Machine (Enum)
+## RadioState Enum
 
-The code uses a `RadioState` enum for explicit state management:
+The state machine uses an explicit enum instead of magic index numbers:
 
 ```rust
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum RadioState {
     Welcome,
-    Playing(usize),  // channel index 0..N-1
+    Playing(usize),  // channel index 0..3
     Off,
 }
 
 impl RadioState {
     fn next(self, num_channels: usize) -> RadioState {
         match self {
-            Welcome => Playing(0),
-            Playing(i) if i + 1 < num_channels => Playing(i + 1),
-            Playing(_) => Off,
-            Off => Welcome,
+            RadioState::Welcome => RadioState::Playing(0),
+            RadioState::Playing(i) if i + 1 < num_channels => RadioState::Playing(i + 1),
+            RadioState::Playing(_) => RadioState::Off,
+            RadioState::Off => RadioState::Welcome,
         }
     }
 }
 ```
 
-**State Transitions:**
+**State Transitions (with 4 channels):**
 ```
 Welcome → Playing(0) → Playing(1) → Playing(2) → Playing(3) → Off → Welcome
 ```
 
-**On startup:** `handle_welcome()` is called immediately, then the loop waits for button presses.
+**Unit Tests:** 7 tests in `src/main.rs` verify all transitions including edge cases.
 
-## Button Input (Debounce)
+## Main Loop
+
+```rust
+// Welcome plays automatically on boot
+handle_welcome(&mut player, &tts);
+
+loop {
+    // 1. Block until button press
+    rx.recv().ok();
+
+    // 2. Drain queued presses (debounce overflow)
+    while rx.try_recv().is_ok() { discarded += 1; }
+
+    // 3. Transition to next state
+    state = state.next(num_channels);
+
+    // 4. Execute state action
+    match state {
+        RadioState::Welcome => handle_welcome(&mut player, &tts),
+        RadioState::Playing(idx) => { /* announce + stream */ },
+        RadioState::Off => { /* stop + announce */ },
+    }
+}
+```
+
+## Button Input (Trailing Edge Debounce)
 
 ```mermaid
 stateDiagram-v2
@@ -128,15 +161,67 @@ stateDiagram-v2
 
     state "Main Thread" as Main {
         Blocked --> GotPress: rx.recv()
-        GotPress --> DrainExtras: Consume queued presses
-        DrainExtras --> ProcessChannel
-        ProcessChannel --> Blocked
+        GotPress --> DrainExtras: while rx.try_recv().is_ok()
+        DrainExtras --> ProcessState: state.next()
+        ProcessState --> Blocked
     }
 
     Input --> Main: mpsc channel
 ```
 
-**Debounce behavior:** Action only registers after user stops pressing for 150ms. Rapid presses reset the timer.
+**Debounce Behavior:**
+- Action registers only after user **stops pressing** for 150ms
+- Rapid presses reset the timer (trailing edge)
+- Prevents double-registration from mechanical bounce
+- Constant: `INPUT_DEBOUNCE_MS = 150`
+
+## TTS Subsystem
+
+```mermaid
+stateDiagram-v2
+    [*] --> EngineSelection: Boot
+
+    state EngineSelection {
+        [*] --> CheckSystemPiper
+        CheckSystemPiper --> TestPiper: Found /opt/piper
+        CheckSystemPiper --> DownloadPiper: Not found
+
+        DownloadPiper --> TestPiper
+        TestPiper --> UsePiper: Works
+        TestPiper --> UseMacSay: Fails (macOS)
+        TestPiper --> NoTTS: Fails (other)
+    }
+
+    EngineSelection --> Ready: engine field set
+
+    state "TTS Methods" as Methods {
+        state "speak_sync() - Blocking" as Sync {
+            [*] --> Synthesize1
+            Synthesize1 --> PlaySamples1: Piper returns samples
+            Synthesize1 --> Done1: macOS say (plays directly)
+            PlaySamples1 --> Done1: sink.sleep_until_end()
+        }
+
+        state "speak() - Fire & Forget" as Async {
+            [*] --> SpawnThread
+            SpawnThread --> Synthesize2
+            Synthesize2 --> PlaySamples2: Piper returns samples
+            Synthesize2 --> Done2: macOS say (plays directly)
+            PlaySamples2 --> Done2
+        }
+    }
+```
+
+**TTS Engine Selection (checked once at boot):**
+1. Try system-installed Piper (`/opt/piper` or `/usr/local/piper`)
+2. Download Piper to `~/.local/share/lego-radio/`
+3. Test Piper with "test" synthesis
+4. Fall back to macOS `say` command if Piper fails
+5. Store result in `engine` field (no runtime checks)
+
+**TTS Methods:**
+- `speak_sync()` - Blocking, waits for completion (welcome sequence, "Radio off")
+- `speak()` - Fire-and-forget, spawns thread (channel announcements)
 
 ## Audio Subsystem
 
@@ -144,46 +229,40 @@ stateDiagram-v2
 stateDiagram-v2
     [*] --> Idle
 
-    state "TTS" as TTS {
-        state "speak_sync() - Blocking" as Sync {
-            [*] --> Synthesize1
-            Synthesize1 --> Play1: Piper samples
-            Synthesize1 --> Done1: macOS say (direct)
-            Play1 --> Done1: sleep_until_end()
-        }
-
-        state "speak() - Fire & Forget" as Async {
-            [*] --> SpawnThread
-            SpawnThread --> Synthesize2
-            Synthesize2 --> Play2: Piper samples
-            Synthesize2 --> Done2: macOS say (direct)
-            Play2 --> Done2
-        }
-    }
-
-    state "Stream" as Stream {
-        [*] --> HTTPConnect
-        HTTPConnect --> ProbeFormat: MP3/AAC
+    state "Stream Playback" as Stream {
+        [*] --> StopExisting: stop() called by play_stream()
+        StopExisting --> HTTPConnect: ureq::get()
+        HTTPConnect --> ProbeFormat: symphonia probe
         ProbeFormat --> CreateDecoder
         CreateDecoder --> PlayLoop
 
         state PlayLoop {
-            [*] --> Ducked: 10% volume
-            Ducked --> Normal: 2 sec elapsed
-            Normal --> ReadPacket
-            ReadPacket --> Decode
-            Decode --> PlaySamples
-            PlaySamples --> ReadPacket
+            [*] --> Ducked: sink.set_volume(0.1)
+            Ducked --> Normal: elapsed >= 2s
+            Normal --> CheckStop
+            CheckStop --> ReadPacket: !stop_flag
+            CheckStop --> Exit: stop_flag set
+            ReadPacket --> Decode: symphonia
+            Decode --> PlaySamples: rodio sink.append()
+            PlaySamples --> CheckStop
         }
 
-        PlayLoop --> [*]: stop_flag set
+        PlayLoop --> [*]: Stream ends or stopped
     }
 
-    Idle --> TTS: speak() or speak_sync()
-    Idle --> Stream: play_stream()
-    Stream --> Idle: stop()
-    TTS --> Idle: Complete
+    Idle --> Stream: play_stream(url)
+    Stream --> Idle: stop() or error
 ```
+
+**Stream Ducking:**
+- Streams start at 10% volume (`DUCKED_VOLUME = 0.1`)
+- After 2 seconds (`DUCK_DURATION_SECS = 2`), volume rises to 80% (`VOLUME = 0.8`)
+- This lets the fire-and-forget TTS announcement be heard
+
+**Stop Behavior:**
+- `stop()` sets `stop_flag` and calls `handle.join()`
+- Waits for stream thread to actually finish before returning
+- Creates new `stop_flag` for next stream
 
 ## Concurrency Model
 
@@ -193,7 +272,8 @@ flowchart TB
         ML[Main Loop]
         ML --> WB[rx.recv - block]
         WB --> DR[Drain extras]
-        DR --> PC[Process channel]
+        DR --> ST[state.next]
+        ST --> PC[match state]
         PC --> ML
     end
 
@@ -205,9 +285,9 @@ flowchart TB
     end
 
     subgraph "Stream Thread (per stream)"
-        ST[Decode packets]
-        ST --> CHK{stop_flag?}
-        CHK -->|No| ST
+        STR[Decode packets]
+        STR --> CHK{stop_flag?}
+        CHK -->|No| STR
         CHK -->|Yes| END[Exit]
     end
 
@@ -218,16 +298,36 @@ flowchart TB
     end
 
     TX -.->|mpsc| WB
-    PC -->|spawn| ST
-    PC -->|spawn| SYN
+    PC -->|play_stream| STR
+    PC -->|speak| SYN
 ```
 
-## Implementation Notes
+**Thread Summary:**
+| Thread | Lifetime | Purpose |
+|--------|----------|---------|
+| Main | Forever | State machine, blocking on rx.recv() |
+| Input | Forever | Debounce button, send to channel |
+| Stream | Per stream | Decode and play audio packets |
+| TTS | Per speak() | Synthesize and play announcement |
 
-**Completed simplifications:**
-- Replaced integer state with `RadioState` enum
-- Removed `pending_press` variable - welcome handled on startup
-- Removed redundant `stop()` call in channel switch
-- Extracted `handle_welcome()` function for clarity
+## Constants
 
-See `docs/improvements.md` for remaining improvement ideas.
+| Constant | Value | Location | Purpose |
+|----------|-------|----------|---------|
+| `INPUT_DEBOUNCE_MS` | 150 | button.rs | Trailing edge debounce |
+| `DUCK_DURATION_SECS` | 2 | audio.rs | How long stream stays quiet |
+| `DUCKED_VOLUME` | 0.1 | audio.rs | Volume during ducking |
+| `VOLUME` | 0.8 | audio.rs | Normal playback volume |
+
+## Channels
+
+Defined in `src/channels.rs`:
+
+| Index | Name | TTS Name | URL |
+|-------|------|----------|-----|
+| 0 | YLE Klassinen | Y L E Classical | icecast.live.yle.fi |
+| 1 | YLE Radio 1 | Y L E Radio 1 | icecast.live.yle.fi |
+| 2 | Soma FM Groove Salad | Soma Groove Salad | ice1.somafm.com |
+| 3 | Soma FM Drone Zone | Soma Drone Zone | ice1.somafm.com |
+
+TTS names spell out abbreviations for natural speech.
