@@ -40,7 +40,7 @@ stateDiagram-v2
         Exit --> [*]: process::exit(0)\nsystemd restarts
         UpToDate --> SayUpToDate: "Up to date." (blocking)
         SayUpToDate --> PromptStart
-        PromptStart --> WaitForPress: "Press button to start." (blocking)
+        PromptStart --> WaitForPress: "Change channel to start playing." (blocking)
         WaitForPress --> [*]
     }
 

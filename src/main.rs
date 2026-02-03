@@ -197,7 +197,7 @@ fn handle_welcome(player: &mut audio::Player, tts: &std::sync::Arc<tts::PiperTts
         }
     }
 
-    player.speak_sync("Press button to start radio.", tts);
+    player.speak_sync("Change channel to start playing.", tts);
 }
 
 fn test_tts() -> Result<()> {
