@@ -47,15 +47,17 @@ stateDiagram-v2
     Welcome --> Playing: Button press → state.next()
 
     state Playing {
-        [*] --> StopPrevious: play_stream() calls stop() internally
-        StopPrevious --> AnnounceChannel: speak() fire-and-forget
-        AnnounceChannel --> StartStream: play_stream()
+        [*] --> DuckAndAnnounce: speak() ducks all streams + TTS
+        DuckAndAnnounce --> StopPrevious: play_stream() calls stop()
+        StopPrevious --> StartStream: Start new stream
 
         state StreamLoop {
-            [*] --> Ducked: 10% volume
-            Ducked --> Normal: After 1.5 seconds
-            Normal --> DecodeLoop
-            DecodeLoop --> DecodeLoop: Read/decode/play packets
+            [*] --> CheckDuck: Check duck_until_ms
+            CheckDuck --> Ducked: now < duck_until
+            CheckDuck --> Normal: now >= duck_until
+            Ducked --> DecodeLoop: 10% volume
+            Normal --> DecodeLoop: 80% volume
+            DecodeLoop --> CheckDuck: Loop
         }
 
         StartStream --> StreamLoop
@@ -221,7 +223,7 @@ stateDiagram-v2
 
 **TTS Methods:**
 - `speak_sync()` - Blocking, waits for completion (welcome sequence, "Radio off")
-- `speak()` - Fire-and-forget, spawns thread (channel announcements)
+- `speak()` - Fire-and-forget, spawns thread, **ducks all streams immediately** (channel announcements)
 
 ## Audio Subsystem
 
@@ -237,14 +239,16 @@ stateDiagram-v2
         CreateDecoder --> PlayLoop
 
         state PlayLoop {
-            [*] --> Ducked: sink.set_volume(0.1)
-            Ducked --> Normal: elapsed >= 2s
-            Normal --> CheckStop
+            [*] --> CheckDuck
+            CheckDuck --> SetDucked: now < duck_until_ms
+            CheckDuck --> SetNormal: now >= duck_until_ms
+            SetDucked --> CheckStop: volume 10%
+            SetNormal --> CheckStop: volume 80%
             CheckStop --> ReadPacket: !stop_flag
             CheckStop --> Exit: stop_flag set
             ReadPacket --> Decode: symphonia
             Decode --> PlaySamples: rodio sink.append()
-            PlaySamples --> CheckStop
+            PlaySamples --> CheckDuck
         }
 
         PlayLoop --> [*]: Stream ends or stopped
@@ -254,11 +258,12 @@ stateDiagram-v2
     Stream --> Idle: stop() or error
 ```
 
-**Stream Ducking:**
-- When `speak()` is called, ALL streams (current and new) duck to 10% volume
-- Ducking lasts for 1.5 seconds (`DUCK_DURATION_MS = 1500`)
-- After duck period, volume rises to 80% (`VOLUME = 0.8`)
-- Uses shared `duck_until_ms` timestamp so ducking affects any playing stream
+**Stream Ducking (shared timestamp):**
+- `speak()` sets `duck_until_ms = now + 1500ms`
+- ALL streams check this timestamp every decode loop iteration
+- If `now < duck_until_ms`: volume = 10% (ducked)
+- If `now >= duck_until_ms`: volume = 80% (normal)
+- This means ducking affects the **current** stream immediately when TTS starts
 
 **Stop Behavior:**
 - `stop()` sets `stop_flag` and calls `handle.join()`
