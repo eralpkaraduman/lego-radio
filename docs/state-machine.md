@@ -8,83 +8,66 @@ stateDiagram-v2
 
     state Boot {
         [*] --> InitLogger
-        InitLogger --> InitTTS: Initialize TTS engine
-        InitTTS --> InitAudio: Create audio player
-        InitAudio --> InitButton: Spawn button listener thread
-        InitButton --> [*]
+        InitLogger --> InitTTS
+        InitTTS --> InitAudio
+        InitAudio --> SpawnInputThread
+        SpawnInputThread --> [*]
     }
 
-    Boot --> Welcome: channel_idx = 0
+    Boot --> Welcome: Auto (handle_welcome called)
 
     state Welcome {
-        [*] --> SayHello
-        SayHello --> CheckingUpdates: "Hello!"
-        CheckingUpdates --> UpdateCheck: "Checking for updates..."
+        [*] --> SayHello: "Hello!"
+        SayHello --> CheckUpdates: "Checking for updates..."
 
         state UpdateCheck <<choice>>
+        CheckUpdates --> UpdateCheck
         UpdateCheck --> Installing: Update available
         UpdateCheck --> UpToDate: No update
 
-        Installing --> UpdateResult: "Installing..."
+        Installing --> InstallResult
 
-        state UpdateResult <<choice>>
-        UpdateResult --> Restart: Success
-        UpdateResult --> UpdateFailed: Failure
+        state InstallResult <<choice>>
+        InstallResult --> Exit: Success
+        InstallResult --> PromptStart: Failure
 
-        Restart --> [*]: Exit & restart
-        UpdateFailed --> WaitForButton: "Update failed"
-        UpToDate --> WaitForButton: "Up to date"
-        WaitForButton --> [*]: "Press button to start"
+        Exit --> [*]: process::exit(0)\nsystemd restarts
+        UpToDate --> PromptStart: "Up to date"
+        PromptStart --> WaitForPress: "Press button to start"
+        WaitForPress --> [*]
     }
 
-    Welcome --> Channel1: Button press
+    Welcome --> Playing: Button press
 
-    state Channel1 {
-        [*] --> Stop1: Stop previous stream
-        Stop1 --> Announce1: Fire & forget TTS
-        Announce1 --> Stream1: Start stream (ducked 2s)
-        Stream1 --> Playing1: Unduck after 2s
-        Playing1 --> [*]
-        note right of Playing1: YLE Classical
+    state Playing {
+        [*] --> StopPrevious: stop() if streaming
+        StopPrevious --> AnnounceChannel: speak() fire-and-forget
+        AnnounceChannel --> StartStream: play_stream()
+
+        state StreamLoop {
+            [*] --> Ducked: Volume 10%
+            Ducked --> Normal: After 2 seconds
+            Normal --> DecodeLoop
+            DecodeLoop --> DecodeLoop: Read/decode/play packets
+        }
+
+        StartStream --> StreamLoop
+        StreamLoop --> [*]: Playing until button press
     }
 
-    Channel1 --> Channel2: Button press
+    note right of Playing
+        Channels 1-4:
+        1. YLE Classical
+        2. YLE Radio 1
+        3. Soma Groove Salad
+        4. Soma Drone Zone
+    end note
 
-    state Channel2 {
-        [*] --> Stop2: Stop previous stream
-        Stop2 --> Announce2: Fire & forget TTS
-        Announce2 --> Stream2: Start stream (ducked 2s)
-        Stream2 --> Playing2: Unduck after 2s
-        Playing2 --> [*]
-        note right of Playing2: YLE Radio 1
-    }
-
-    Channel2 --> Channel3: Button press
-
-    state Channel3 {
-        [*] --> Stop3: Stop previous stream
-        Stop3 --> Announce3: Fire & forget TTS
-        Announce3 --> Stream3: Start stream (ducked 2s)
-        Stream3 --> Playing3: Unduck after 2s
-        Playing3 --> [*]
-        note right of Playing3: Soma Groove Salad
-    }
-
-    Channel3 --> Channel4: Button press
-
-    state Channel4 {
-        [*] --> Stop4: Stop previous stream
-        Stop4 --> Announce4: Fire & forget TTS
-        Announce4 --> Stream4: Start stream (ducked 2s)
-        Stream4 --> Playing4: Unduck after 2s
-        Playing4 --> [*]
-        note right of Playing4: Soma Drone Zone
-    }
-
-    Channel4 --> Off: Button press
+    Playing --> Playing: Button press\n(next channel)
+    Playing --> Off: Button press\n(after last channel)
 
     state Off {
-        [*] --> StopStream: Stop stream
+        [*] --> StopStream: stop()
         StopStream --> SayOff: "Radio off"
         SayOff --> Idle
         Idle --> [*]
@@ -93,34 +76,67 @@ stateDiagram-v2
     Off --> Welcome: Button press
 ```
 
-## Button Input Handling
+## State Machine (Enum)
+
+The code uses a `RadioState` enum for explicit state management:
+
+```rust
+enum RadioState {
+    Welcome,
+    Playing(usize),  // channel index 0..N-1
+    Off,
+}
+
+impl RadioState {
+    fn next(self, num_channels: usize) -> RadioState {
+        match self {
+            Welcome => Playing(0),
+            Playing(i) if i + 1 < num_channels => Playing(i + 1),
+            Playing(_) => Off,
+            Off => Welcome,
+        }
+    }
+}
+```
+
+**State Transitions:**
+```
+Welcome → Playing(0) → Playing(1) → Playing(2) → Playing(3) → Off → Welcome
+```
+
+**On startup:** `handle_welcome()` is called immediately, then the loop waits for button presses.
+
+## Button Input (Debounce)
 
 ```mermaid
 stateDiagram-v2
-    [*] --> WaitingForPress
+    [*] --> WaitForPress
 
-    state "Input Thread" as InputThread {
-        WaitingForPress --> PressDetected: Pin goes LOW
-        PressDetected --> Debouncing: Start 150ms timer
+    state "Input Thread" as Input {
+        WaitForPress --> PressDetected: Pin LOW
 
-        state Debouncing {
-            [*] --> Idle
-            Idle --> ResetTimer: Another press detected
-            ResetTimer --> Idle
-            Idle --> Complete: 150ms elapsed with no press
+        state "Trailing Edge Debounce" as Debounce {
+            [*] --> TimerRunning
+            TimerRunning --> TimerRunning: Another press\n(reset to 0)
+            TimerRunning --> Complete: 150ms idle
         }
 
-        Debouncing --> SendEvent: Debounce complete
-        SendEvent --> WaitingForPress: Send to channel
+        PressDetected --> Debounce
+        Debounce --> SendToChannel: tx.send(())
+        SendToChannel --> WaitForPress
     }
 
-    state "Main Thread" as MainThread {
-        Blocked --> ProcessPress: Receive from channel
-        ProcessPress --> DrainExtras: Consume extra presses
-        DrainExtras --> HandleChannel: Process channel change
-        HandleChannel --> Blocked: Wait for next press
+    state "Main Thread" as Main {
+        Blocked --> GotPress: rx.recv()
+        GotPress --> DrainExtras: Consume queued presses
+        DrainExtras --> ProcessChannel
+        ProcessChannel --> Blocked
     }
+
+    Input --> Main: mpsc channel
 ```
+
+**Debounce behavior:** Action only registers after user stops pressing for 150ms. Rapid presses reset the timer.
 
 ## Audio Subsystem
 
@@ -128,29 +144,39 @@ stateDiagram-v2
 stateDiagram-v2
     [*] --> Idle
 
-    state "TTS Playback" as TTS {
-        [*] --> Synthesize
-        Synthesize --> PlaySamples: Piper returns samples
-        Synthesize --> DirectPlay: macOS say (empty samples)
-        PlaySamples --> [*]: Block until done
-        DirectPlay --> [*]: Already played
-    }
-
-    state "Stream Playback" as Stream {
-        [*] --> Connect: HTTP GET
-        Connect --> Probe: Detect format (MP3/AAC)
-        Probe --> Decode: Create decoder
-
-        state Decode {
-            [*] --> Ducked: Volume 10%
-            Ducked --> Normal: After 2 seconds
-            Normal --> ReadPacket
-            ReadPacket --> DecodePacket
-            DecodePacket --> PlayPacket
-            PlayPacket --> ReadPacket: Loop
+    state "TTS" as TTS {
+        state "speak_sync() - Blocking" as Sync {
+            [*] --> Synthesize1
+            Synthesize1 --> Play1: Piper samples
+            Synthesize1 --> Done1: macOS say (direct)
+            Play1 --> Done1: sleep_until_end()
         }
 
-        Decode --> [*]: Stop flag set
+        state "speak() - Fire & Forget" as Async {
+            [*] --> SpawnThread
+            SpawnThread --> Synthesize2
+            Synthesize2 --> Play2: Piper samples
+            Synthesize2 --> Done2: macOS say (direct)
+            Play2 --> Done2
+        }
+    }
+
+    state "Stream" as Stream {
+        [*] --> HTTPConnect
+        HTTPConnect --> ProbeFormat: MP3/AAC
+        ProbeFormat --> CreateDecoder
+        CreateDecoder --> PlayLoop
+
+        state PlayLoop {
+            [*] --> Ducked: 10% volume
+            Ducked --> Normal: 2 sec elapsed
+            Normal --> ReadPacket
+            ReadPacket --> Decode
+            Decode --> PlaySamples
+            PlaySamples --> ReadPacket
+        }
+
+        PlayLoop --> [*]: stop_flag set
     }
 
     Idle --> TTS: speak() or speak_sync()
@@ -159,51 +185,49 @@ stateDiagram-v2
     TTS --> Idle: Complete
 ```
 
-## Channel Index Logic
-
-```
-channel_idx | State
-------------|------------------
--1          | Initial (before first iteration)
- 0          | Welcome sequence
- 1          | Channel 1 (YLE Classical)
- 2          | Channel 2 (YLE Radio 1)
- 3          | Channel 3 (Soma Groove Salad)
- 4          | Channel 4 (Soma Drone Zone)
- 5          | Radio Off
- 6+         | Wraps to Welcome (0)
-```
-
 ## Concurrency Model
 
 ```mermaid
 flowchart TB
     subgraph "Main Thread"
         ML[Main Loop]
-        ML --> |"rx.recv()"| WB[Wait for button]
-        WB --> |"pending_press"| PC[Process channel]
+        ML --> WB[rx.recv - block]
+        WB --> DR[Drain extras]
+        DR --> PC[Process channel]
         PC --> ML
     end
 
-    subgraph "Input Thread"
+    subgraph "Input Thread (spawned once)"
         BL[Button Loop]
-        BL --> |"wait_for_press()"| DB[Debounce 150ms]
-        DB --> |"tx.send()"| BL
+        BL --> DP[Debounce 150ms]
+        DP --> TX[tx.send]
+        TX --> BL
     end
 
-    subgraph "Stream Thread"
-        ST[Stream Audio]
-        ST --> |"decode packets"| ST
-        ST --> |"check stop_flag"| SE[End]
+    subgraph "Stream Thread (per stream)"
+        ST[Decode packets]
+        ST --> CHK{stop_flag?}
+        CHK -->|No| ST
+        CHK -->|Yes| END[Exit]
     end
 
     subgraph "TTS Thread (fire & forget)"
-        TT[Synthesize]
-        TT --> TP[Play samples]
-        TP --> TE[End]
+        SYN[Synthesize]
+        SYN --> PLY[Play samples]
+        PLY --> DONE[Exit]
     end
 
-    BL -.-> |"mpsc channel"| WB
-    PC --> |"spawn"| ST
-    PC --> |"spawn"| TT
+    TX -.->|mpsc| WB
+    PC -->|spawn| ST
+    PC -->|spawn| SYN
 ```
+
+## Implementation Notes
+
+**Completed simplifications:**
+- Replaced integer state with `RadioState` enum
+- Removed `pending_press` variable - welcome handled on startup
+- Removed redundant `stop()` call in channel switch
+- Extracted `handle_welcome()` function for clarity
+
+See `docs/improvements.md` for remaining improvement ideas.
