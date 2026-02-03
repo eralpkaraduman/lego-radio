@@ -168,6 +168,7 @@ fn run_radio() -> Result<()> {
             }
             RadioState::Off => {
                 info!("Radio OFF");
+                player.mute_active();  // Mute immediately
                 player.speak_sync("Radio off", &tts);
                 player.disconnect_all();  // Save bandwidth
             }

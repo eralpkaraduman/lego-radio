@@ -273,8 +273,8 @@ impl MultiStreamPlayer {
         self.active_index = Some(index);
     }
 
-    /// Mute the active stream (for TTS)
-    fn mute_active(&self) {
+    /// Mute the active stream (for TTS or Off state)
+    pub fn mute_active(&self) {
         if let Some(idx) = self.active_index {
             if let Some(ref sh) = self.streams[idx] {
                 if let Ok(sink_guard) = sh.sink.lock() {
