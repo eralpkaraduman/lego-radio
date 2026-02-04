@@ -21,6 +21,7 @@ const VOICE_BASE_URL: &str =
 
 /// TTS engine selection (determined once at boot)
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]  // Variants are platform-specific
 pub enum TtsEngine {
     /// Native piper binary (Linux only)
     Piper,
@@ -144,7 +145,8 @@ impl PiperTts {
         Ok(tts)
     }
 
-    /// Test if native piper works
+    /// Test if native piper works (Linux only)
+    #[allow(dead_code)]
     fn test_piper(&self) -> bool {
         debug!("Testing native Piper...");
         match self.synthesize_with_piper("test") {

@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use log::{debug, error, info, warn};
 use rodio::buffer::SamplesBuffer;
-use rodio::{OutputStream, OutputStreamHandle, Sink};
+use rodio::{OutputStream, Sink};
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -37,9 +37,6 @@ pub struct AudioPipeline {
 
     /// Keep OutputStream alive (audio stops if dropped)
     _stream: OutputStream,
-
-    /// Stream handle for creating sinks (unused but kept for potential future use)
-    _stream_handle: OutputStreamHandle,
 }
 
 /// Handle for controlling the streaming thread
@@ -74,7 +71,6 @@ impl AudioPipeline {
             sink,
             stream_thread: None,
             _stream: stream,
-            _stream_handle: stream_handle,
         })
     }
 
@@ -365,17 +361,11 @@ fn stream_loop(
         let source = SamplesBuffer::new(channels as u16, sample_rate, samples);
         sink.append(source);
 
-        // Ensure playback is active
+        // Ensure playback is active on first packet
         if packet_count == 0 {
             sink.play();
-            info!("Started playback");
         }
-
         packet_count += 1;
-        if packet_count % 100 == 0 {
-            info!("Decoded {} packets, sink empty={}, paused={}",
-                  packet_count, sink.empty(), sink.is_paused());
-        }
     }
 
     debug!("Stream loop ended");
