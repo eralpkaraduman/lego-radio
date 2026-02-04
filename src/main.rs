@@ -173,6 +173,8 @@ fn run_radio() -> Result<()> {
             RadioState::Off => {
                 info!("Radio OFF");
                 pipeline.announce("Radio off", &tts);
+                // Drain any presses during announcement
+                while rx.try_recv().is_ok() {}
             }
         }
     }

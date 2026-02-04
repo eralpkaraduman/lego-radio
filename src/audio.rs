@@ -15,7 +15,10 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
 /// Playback volume (0.0 to 1.0)
-const VOLUME: f32 = 0.8;
+const VOLUME: f32 = 1.0;
+
+/// Beep volume relative to main volume
+const BEEP_VOLUME: f32 = 0.3;
 
 // =============================================================================
 // AudioPipeline - Simple connect-on-demand audio streaming
@@ -156,7 +159,7 @@ impl AudioPipeline {
                 } else {
                     1.0
                 };
-                (t * frequency * 2.0 * std::f32::consts::PI).sin() * 0.3 * envelope
+                (t * frequency * 2.0 * std::f32::consts::PI).sin() * BEEP_VOLUME * envelope
             })
             .collect();
 
