@@ -21,6 +21,16 @@ pub const CHANNELS: &[Channel] = &[
         url: "https://icecast.live.yle.fi/radio/YleRadio1/icecast.audio",
     },
     Channel {
+        name: "YLE Radio Suomi",
+        tts_name: "Y L E Radio Suomi",
+        url: "https://icecast.live.yle.fi/radio/YleRS/icecast.audio",
+    },
+    Channel {
+        name: "YleX",
+        tts_name: "Y L E X",
+        url: "https://icecast.live.yle.fi/radio/YleX/icecast.audio",
+    },
+    Channel {
         name: "Soma FM Groove Salad",
         tts_name: "Soma Groove Salad",
         url: "https://ice1.somafm.com/groovesalad-128-mp3",
