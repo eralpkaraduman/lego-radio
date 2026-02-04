@@ -5,7 +5,7 @@ mod tts;
 mod updater;
 
 use anyhow::Result;
-use log::{error, info};
+use log::{error, info, warn};
 use std::sync::mpsc::Receiver;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -180,7 +180,13 @@ fn run_radio() -> Result<()> {
     }
 }
 
-/// Play a channel with interrupt support
+/// Retry interval for failed connections (seconds)
+const RECONNECT_INTERVAL_SECS: u64 = 30;
+
+/// How often to check stream status (milliseconds)
+const STREAM_CHECK_INTERVAL_MS: u64 = 500;
+
+/// Play a channel with interrupt support and auto-reconnect
 /// Returns false if interrupted (caller should continue loop)
 fn play_channel(
     pipeline: &mut audio::AudioPipeline,
@@ -203,14 +209,61 @@ fn play_channel(
         return false;
     }
 
-    // Connect and play
-    if pipeline.connect_and_play(channel.url) {
-        // Successfully connected - stream is now playing
-        true
-    } else {
-        // Connection failed
-        pipeline.announce("Station unavailable. Try another channel.", tts);
-        true
+    // Main playback loop with auto-reconnect
+    loop {
+        // Try to connect
+        if pipeline.connect_and_play(channel.url) {
+            info!("Stream connected, monitoring playback");
+
+            // Monitor stream - check for button press or stream disconnect
+            loop {
+                // Check for button interrupt
+                if rx.try_recv().is_ok() {
+                    info!("Interrupted by button press");
+                    return false;
+                }
+
+                // Check if stream is still active
+                if !pipeline.is_stream_active() {
+                    warn!("Stream disconnected, will reconnect");
+                    break; // Exit monitor loop, will reconnect
+                }
+
+                std::thread::sleep(std::time::Duration::from_millis(STREAM_CHECK_INTERVAL_MS));
+            }
+
+            // Stream disconnected - announce and reconnect
+            if !pipeline.announce_interruptible("Connection lost. Reconnecting.", tts, Some(rx)) {
+                info!("Interrupted during reconnect announcement");
+                return false;
+            }
+        } else {
+            // Initial connection failed
+            error!("Connection failed for {}", channel.name);
+            if !pipeline.announce_interruptible("Connection failed. Retrying.", tts, Some(rx)) {
+                info!("Interrupted during retry announcement");
+                return false;
+            }
+        }
+
+        // Wait before retry, checking for interrupts
+        info!("Waiting {}s before reconnect attempt", RECONNECT_INTERVAL_SECS);
+        let wait_until = std::time::Instant::now()
+            + std::time::Duration::from_secs(RECONNECT_INTERVAL_SECS);
+
+        while std::time::Instant::now() < wait_until {
+            if rx.try_recv().is_ok() {
+                info!("Interrupted during reconnect wait");
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        // Announce retry attempt
+        if !pipeline.announce_interruptible("Reconnecting", tts, Some(rx)) {
+            info!("Interrupted during reconnecting announcement");
+            return false;
+        }
     }
 }
 

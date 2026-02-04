@@ -56,6 +56,10 @@ impl StreamHandle {
     fn join(self) {
         let _ = self.thread.join();
     }
+
+    fn is_finished(&self) -> bool {
+        self.thread.is_finished()
+    }
 }
 
 impl AudioPipeline {
@@ -136,6 +140,14 @@ impl AudioPipeline {
                 self.stop();
                 false
             }
+        }
+    }
+
+    /// Check if stream is still active (not disconnected)
+    pub fn is_stream_active(&self) -> bool {
+        match &self.stream_thread {
+            Some(handle) => !handle.is_finished(),
+            None => false,
         }
     }
 
@@ -529,11 +541,106 @@ impl HlsReader {
         let mut data = Vec::new();
         response.into_reader().read_to_end(&mut data)?;
 
-        self.current_segment = Cursor::new(data);
+        // Check if this is a TS segment (starts with 0x47 sync byte)
+        let audio_data = if data.len() >= 188 && data[0] == 0x47 {
+            debug!("HLS: demuxing TS segment ({} bytes)", data.len());
+            demux_ts_audio(&data)
+        } else {
+            // Not TS, use raw data (might be raw AAC)
+            data
+        };
+
+        self.current_segment = Cursor::new(audio_data);
         self.next_segment_idx += 1;
 
         Ok(())
     }
+}
+
+/// Demux MPEG-TS data to extract audio (AAC) payload
+///
+/// TS packets are 188 bytes with sync byte 0x47.
+/// Audio is typically on PID 0x101 (257) or similar.
+/// This extracts PES payload from audio packets.
+fn demux_ts_audio(ts_data: &[u8]) -> Vec<u8> {
+    let mut audio_data = Vec::new();
+    let mut audio_pid: Option<u16> = None;
+
+    // Process TS packets (188 bytes each)
+    for chunk in ts_data.chunks(188) {
+        if chunk.len() < 188 || chunk[0] != 0x47 {
+            continue; // Skip invalid packets
+        }
+
+        // Parse TS header
+        let pid = (((chunk[1] & 0x1F) as u16) << 8) | (chunk[2] as u16);
+        let payload_start = (chunk[1] & 0x40) != 0;
+        let has_adaptation = (chunk[3] & 0x20) != 0;
+        let has_payload = (chunk[3] & 0x10) != 0;
+
+        if !has_payload {
+            continue;
+        }
+
+        // Calculate payload offset
+        let mut offset = 4;
+        if has_adaptation {
+            let adaptation_len = chunk[4] as usize;
+            offset += 1 + adaptation_len;
+        }
+
+        if offset >= 188 {
+            continue;
+        }
+
+        // For PAT (PID 0), we could parse to find audio PID
+        // For simplicity, assume audio is on common PIDs or any PES with audio
+        if pid == 0 {
+            // PAT - could parse to find PMT, but skip for simplicity
+            continue;
+        }
+
+        // Check if this looks like audio (common audio PIDs or detect from stream)
+        // BBC typically uses PID 0x22 (34) or similar for audio
+        let is_audio_pid = audio_pid.map(|p| p == pid).unwrap_or(false)
+            || (pid >= 0x20 && pid <= 0x1FFF && pid != 0x1FFF);
+
+        if !is_audio_pid && audio_pid.is_some() {
+            continue;
+        }
+
+        let payload = &chunk[offset..];
+
+        // Check for PES header (starts with 0x00 0x00 0x01)
+        if payload_start && payload.len() >= 9 {
+            if payload[0] == 0x00 && payload[1] == 0x00 && payload[2] == 0x01 {
+                let stream_id = payload[3];
+
+                // Audio stream IDs: 0xC0-0xDF (MPEG audio), 0xBD (private/AAC)
+                if (stream_id >= 0xC0 && stream_id <= 0xDF) || stream_id == 0xBD {
+                    if audio_pid.is_none() {
+                        audio_pid = Some(pid);
+                        debug!("HLS: found audio on PID {}", pid);
+                    }
+
+                    // Skip PES header to get to audio data
+                    let pes_header_len = 9 + payload[8] as usize;
+                    if pes_header_len < payload.len() {
+                        audio_data.extend_from_slice(&payload[pes_header_len..]);
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // Continuation of audio PES
+        if audio_pid == Some(pid) {
+            audio_data.extend_from_slice(payload);
+        }
+    }
+
+    debug!("HLS: extracted {} bytes of audio from TS", audio_data.len());
+    audio_data
 }
 
 impl Read for HlsReader {
