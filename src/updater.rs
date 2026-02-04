@@ -43,10 +43,15 @@ pub fn check_for_update() -> Option<String> {
 }
 
 /// Download and install the latest version
-pub fn do_update() -> Result<()> {
-    info!("Checking for updates...");
-
-    let latest = check_for_update().ok_or_else(|| anyhow!("Already up to date (v{})", VERSION))?;
+/// If version is None, checks for update first. If Some, uses provided version.
+pub fn do_update_to(version: Option<&str>) -> Result<()> {
+    let latest = match version {
+        Some(v) => v.to_string(),
+        None => {
+            info!("Checking for updates...");
+            check_for_update().ok_or_else(|| anyhow!("Already up to date (v{})", VERSION))?
+        }
+    };
 
     info!("Downloading v{}...", latest);
 
@@ -113,6 +118,11 @@ pub fn do_update() -> Result<()> {
     info!("Restart the service: sudo systemctl restart lego-radio");
 
     Ok(())
+}
+
+/// Download and install the latest version (checks for update first)
+pub fn do_update() -> Result<()> {
+    do_update_to(None)
 }
 
 /// Compare semantic versions (returns true if a > b)

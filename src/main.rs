@@ -278,7 +278,7 @@ fn handle_welcome(pipeline: &mut audio::AudioPipeline, tts: &tts::PiperTts) {
             info!("Update available: v{}", version);
             pipeline.announce("Update found. Installing.", tts);
 
-            match updater::do_update() {
+            match updater::do_update_to(Some(&version)) {
                 Ok(()) => {
                     pipeline.announce("Update complete. Restarting.", tts);
                     std::thread::sleep(std::time::Duration::from_secs(2));
