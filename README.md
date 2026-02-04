@@ -75,7 +75,60 @@ sudo systemctl restart lego-radio
 
 ## Development
 
+### macOS Setup (Required)
+
+On macOS, TTS requires Docker with a Piper container. **This must be set up before running the app.**
+
+1. **Install Docker Desktop** from https://docker.com
+
+2. **Build the Piper Docker image:**
+   ```bash
+   docker build -f Dockerfile.piper -t lego-radio-piper .
+   ```
+
+3. **Verify it works:**
+   ```bash
+   cargo run -- --test-tts
+   ```
+
+The voice model (~63MB) will be downloaded automatically on first run to `~/.local/share/lego-radio/`.
+
+### Changing the Voice
+
+Edit `src/tts.rs` to change the Piper voice:
+
+```rust
+// Voice Configuration
+const VOICE_MODEL: &str = "en_US-joe-medium";
+const VOICE_BASE_URL: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/joe/medium";
+```
+
+Browse available voices at: https://huggingface.co/rhasspy/piper-voices/tree/main/en
+
+After changing, delete the old model and restart:
+```bash
+rm ~/.local/share/lego-radio/*.onnx*
+cargo run -- --test-tts
+```
+
+### Running Locally
+
+```bash
+# Run the radio (press Enter to cycle channels)
+cargo run
+
+# Test TTS only
+cargo run -- --test-tts
+
+# Test a single stream
+cargo run -- --test-stream
+```
+
+### Editing Channels
+
 Edit `src/channels.rs` to change radio stations. Bump version in `Cargo.toml` and push to trigger a new release.
+
+### Cross-Compiling for Raspberry Pi
 
 ```bash
 # Build (requires Docker)

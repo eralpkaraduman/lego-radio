@@ -1,21 +1,32 @@
 use anyhow::{anyhow, Result};
-use log::{debug, info, warn};
+use log::{debug, info};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+// =============================================================================
+// Voice Configuration - Change these to use a different Piper voice
+// =============================================================================
+
+/// Piper voice model name (without .onnx extension)
+/// Browse voices at: https://huggingface.co/rhasspy/piper-voices/tree/main/en
+const VOICE_MODEL: &str = "en_US-joe-medium";
+
+/// Base URL for downloading the voice model
+const VOICE_BASE_URL: &str =
+    "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/joe/medium";
+
+// =============================================================================
+
 /// TTS engine selection (determined once at boot)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TtsEngine {
-    /// Native piper binary (Linux, or macOS with working binary)
+    /// Native piper binary (Linux only)
     Piper,
-    /// Docker-based piper (macOS fallback)
+    /// Docker-based piper (macOS only)
     #[cfg(target_os = "macos")]
     DockerPiper,
-    /// macOS say command (last resort fallback)
-    #[cfg(target_os = "macos")]
-    MacSay,
     /// No TTS available
     None,
 }
@@ -32,8 +43,63 @@ pub struct PiperTts {
 impl PiperTts {
     /// Create a new PiperTts instance, downloading required files if needed
     /// Tests TTS capability once at boot and remembers the result
+    ///
+    /// On Linux: Uses native Piper binary (downloaded if needed)
+    /// On macOS: Requires Docker with lego-radio-piper image (will error if not set up)
     pub fn new() -> Result<Self> {
-        // Check if piper is installed system-wide (e.g., in Docker on Pi)
+        #[cfg(target_os = "macos")]
+        {
+            Self::new_macos()
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self::new_linux()
+        }
+    }
+
+    /// macOS: Use Docker Piper only (no native Piper support)
+    #[cfg(target_os = "macos")]
+    fn new_macos() -> Result<Self> {
+        info!("macOS detected - using Docker Piper");
+
+        let data_dir = get_data_dir()?;
+        fs::create_dir_all(&data_dir)?;
+
+        let model_path = data_dir.join(format!("{}.onnx", VOICE_MODEL));
+
+        let mut tts = Self {
+            piper_dir: data_dir.clone(),
+            piper_path: PathBuf::new(), // Not used on macOS
+            model_path,
+            engine: TtsEngine::None,
+        };
+
+        // Download voice model if needed
+        if !tts.model_path.exists() {
+            tts.download_voice()?;
+        }
+
+        // Verify Docker Piper is available
+        if !tts.test_docker_piper() {
+            return Err(anyhow!(
+                "Docker Piper not available.\n\n\
+                On macOS, you must set up Docker Piper first:\n\
+                  1. Install Docker Desktop\n\
+                  2. Run: docker build -f Dockerfile.piper -t lego-radio-piper .\n\n\
+                See README.md for details."
+            ));
+        }
+
+        info!("TTS engine: Piper (Docker)");
+        tts.engine = TtsEngine::DockerPiper;
+        Ok(tts)
+    }
+
+    /// Linux: Use native Piper binary
+    #[cfg(not(target_os = "macos"))]
+    fn new_linux() -> Result<Self> {
+        // Check if piper is installed system-wide (e.g., on Raspberry Pi)
         if let Some(mut tts) = Self::try_system_piper()? {
             if tts.test_piper() {
                 info!("Using system-installed piper");
@@ -48,7 +114,7 @@ impl PiperTts {
 
         let piper_dir = data_dir.join("piper");
         let piper_path = piper_dir.join(get_piper_binary_name());
-        let model_path = data_dir.join("en_US-lessac-medium.onnx");
+        let model_path = data_dir.join(format!("{}.onnx", VOICE_MODEL));
 
         let mut tts = Self {
             piper_dir,
@@ -57,7 +123,7 @@ impl PiperTts {
             engine: TtsEngine::None,
         };
 
-        // Download voice model if needed (used by all engines)
+        // Download voice model if needed
         if !tts.model_path.exists() {
             tts.download_voice()?;
         }
@@ -67,29 +133,12 @@ impl PiperTts {
             tts.download_piper()?;
         }
 
-        // Test engines in order of preference
+        // Test native Piper
         if tts.test_piper() {
             info!("TTS engine: Piper (native)");
             tts.engine = TtsEngine::Piper;
         } else {
-            #[cfg(target_os = "macos")]
-            {
-                if tts.test_docker_piper() {
-                    info!("TTS engine: Piper (Docker)");
-                    tts.engine = TtsEngine::DockerPiper;
-                } else if tts.test_say() {
-                    info!("TTS engine: macOS say");
-                    tts.engine = TtsEngine::MacSay;
-                } else {
-                    warn!("No TTS engine available");
-                    tts.engine = TtsEngine::None;
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                warn!("Piper not working, TTS disabled");
-                tts.engine = TtsEngine::None;
-            }
+            return Err(anyhow!("Piper TTS failed to initialize"));
         }
 
         Ok(tts)
@@ -142,20 +191,14 @@ impl PiperTts {
                 }
             }
             _ => {
-                info!("Docker Piper image not found. Build it with: docker build -f Dockerfile.piper -t lego-radio-piper .");
+                debug!("Docker Piper image 'lego-radio-piper' not found");
                 false
             }
         }
     }
 
-    /// Test if macOS say works
-    #[cfg(target_os = "macos")]
-    fn test_say(&self) -> bool {
-        debug!("Testing macOS say...");
-        Command::new("say").arg("test").output().is_ok()
-    }
-
-    /// Try to use system-installed piper (e.g., in Docker on Pi)
+    /// Try to use system-installed piper (e.g., on Raspberry Pi)
+    #[cfg(not(target_os = "macos"))]
     fn try_system_piper() -> Result<Option<Self>> {
         let system_paths = [
             PathBuf::from("/opt/piper"),
@@ -164,7 +207,7 @@ impl PiperTts {
 
         for piper_dir in system_paths {
             let piper_path = piper_dir.join("piper");
-            let model_path = piper_dir.join("voices/en_US-lessac-medium.onnx");
+            let model_path = piper_dir.join(format!("voices/{}.onnx", VOICE_MODEL));
 
             if piper_path.exists() && model_path.exists() {
                 return Ok(Some(Self {
@@ -186,8 +229,6 @@ impl PiperTts {
             TtsEngine::Piper => self.synthesize_with_piper(text),
             #[cfg(target_os = "macos")]
             TtsEngine::DockerPiper => self.synthesize_with_docker_piper(text),
-            #[cfg(target_os = "macos")]
-            TtsEngine::MacSay => self.synthesize_with_say(text),
             TtsEngine::None => Err(anyhow!("No TTS engine available")),
         }
     }
@@ -203,7 +244,7 @@ impl PiperTts {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        // Set library path
+        // Set library path on Linux
         #[cfg(target_os = "linux")]
         cmd.env(
             "LD_LIBRARY_PATH",
@@ -247,7 +288,7 @@ impl PiperTts {
                 "run", "--rm", "-i",
                 "-v", &format!("{}:/data", data_dir.display()),
                 "lego-radio-piper",
-                "--model", "/data/en_US-lessac-medium.onnx",
+                "--model", &format!("/data/{}.onnx", VOICE_MODEL),
                 "--output-raw",
             ])
             .stdin(Stdio::piped())
@@ -277,23 +318,7 @@ impl PiperTts {
         Ok(samples)
     }
 
-    /// Speak using macOS say command (blocking, plays directly)
-    #[cfg(target_os = "macos")]
-    fn synthesize_with_say(&self, text: &str) -> Result<Vec<i16>> {
-        debug!("macOS say: {}", text);
-        let status = Command::new("say")
-            .arg(text)
-            .status()
-            .map_err(|e| anyhow!("Failed to run say: {}", e))?;
-
-        if !status.success() {
-            return Err(anyhow!("say command failed"));
-        }
-
-        // Return empty samples - audio was already played by say
-        Ok(vec![])
-    }
-
+    #[cfg(not(target_os = "macos"))]
     fn download_piper(&self) -> Result<()> {
         let url = get_piper_download_url()?;
         info!("Downloading piper from: {}", url);
@@ -330,16 +355,13 @@ impl PiperTts {
     }
 
     fn download_voice(&self) -> Result<()> {
-        let base_url =
-            "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium";
-
-        info!("Downloading voice model...");
+        info!("Downloading voice model: {}", VOICE_MODEL);
         download_file(
-            &format!("{}/en_US-lessac-medium.onnx", base_url),
+            &format!("{}/{}.onnx", VOICE_BASE_URL, VOICE_MODEL),
             &self.model_path,
         )?;
         download_file(
-            &format!("{}/en_US-lessac-medium.onnx.json", base_url),
+            &format!("{}/{}.onnx.json", VOICE_BASE_URL, VOICE_MODEL),
             &self.model_path.with_extension("onnx.json"),
         )?;
 
@@ -353,6 +375,7 @@ fn get_data_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".local/share/lego-radio"))
 }
 
+#[cfg(not(target_os = "macos"))]
 fn get_piper_binary_name() -> &'static str {
     if cfg!(windows) {
         "piper.exe"
@@ -361,6 +384,7 @@ fn get_piper_binary_name() -> &'static str {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn get_piper_download_url() -> Result<String> {
     let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
 
@@ -368,8 +392,6 @@ fn get_piper_download_url() -> Result<String> {
         ("linux", "aarch64") => "piper_linux_aarch64.tar.gz",
         ("linux", "x86_64") => "piper_linux_x86_64.tar.gz",
         ("linux", "arm") => "piper_linux_armv7l.tar.gz",
-        ("macos", "aarch64") => "piper_macos_aarch64.tar.gz",
-        ("macos", "x86_64") => "piper_macos_x64.tar.gz",
         _ => return Err(anyhow!("Unsupported platform: {}-{}", os, arch)),
     };
 
@@ -404,6 +426,13 @@ mod tests {
         assert!(dir.to_str().unwrap().contains("lego-radio"));
     }
 
+    #[test]
+    fn test_voice_config() {
+        assert!(!VOICE_MODEL.is_empty());
+        assert!(VOICE_BASE_URL.starts_with("https://"));
+    }
+
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn test_piper_download_url() {
         let url = get_piper_download_url().unwrap();

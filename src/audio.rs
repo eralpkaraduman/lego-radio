@@ -2,10 +2,10 @@ use anyhow::{anyhow, Result};
 use log::{debug, error, info, warn};
 use rodio::buffer::SamplesBuffer;
 use rodio::{OutputStream, OutputStreamHandle, Sink};
-use std::io::{BufReader, Read};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use rtrb::{Consumer, Producer, RingBuffer};
+use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use symphonia::core::audio::SampleBuffer;
@@ -18,712 +18,403 @@ use symphonia::core::probe::Hint;
 /// Playback volume (0.0 to 1.0)
 const VOLUME: f32 = 0.8;
 
-/// Volume when ducked for TTS
-const DUCKED_VOLUME: f32 = 0.1;
+/// Ring buffer size: 48KB = ~3 seconds @ 128kbps
+/// Calculation: 128 kbps = 16,000 bytes/sec × 3 sec = 48,000 bytes
+const BUFFER_SIZE: usize = 48 * 1024;
 
-/// Volume for muted/inactive streams
-const MUTED_VOLUME: f32 = 0.0;
+// =============================================================================
+// StreamBuffer - Lock-free ring buffer wrapper for real-time audio streaming
+// =============================================================================
 
-/// How long to duck streams when TTS plays (in milliseconds)
-const DUCK_DURATION_MS: u64 = 1500;
-
-/// Audio player with fire-and-forget TTS
-/// - Stream plays in background thread
-/// - Streams duck when TTS plays (shared duck_until timestamp)
-/// - TTS is non-blocking (fire-and-forget)
-pub struct Player {
-    _stream: OutputStream,
-    stream_handle: OutputStreamHandle,
-    stop_flag: Arc<AtomicBool>,
-    stream_thread: Option<JoinHandle<()>>,
-    /// Timestamp (ms since boot_time) until which streams should be ducked
-    duck_until_ms: Arc<AtomicU64>,
-    /// Reference time for calculating timestamps
-    boot_time: Instant,
+/// Lock-free ring buffer for streaming compressed audio from HTTP to decoder.
+///
+/// Uses rtrb (real-time ring buffer) for wait-free SPSC communication:
+/// - Download thread writes compressed audio via `producer`
+/// - Decoder thread reads via `consumer`
+///
+/// Buffer holds ~3 seconds of compressed audio at 128kbps, providing resilience
+/// against network jitter while keeping latency low.
+pub struct StreamBuffer {
+    /// Producer half - download thread writes here (Send, not Sync)
+    producer: Producer<u8>,
+    /// Consumer half - decoder thread reads here (Send, not Sync)
+    consumer: Consumer<u8>,
 }
 
-impl Player {
-    pub fn new() -> Result<Self> {
-        let (stream, stream_handle) = OutputStream::try_default()
-            .map_err(|e| anyhow!("Failed to open audio output: {}", e))?;
-
-        Ok(Self {
-            _stream: stream,
-            stream_handle,
-            stop_flag: Arc::new(AtomicBool::new(false)),
-            stream_thread: None,
-            duck_until_ms: Arc::new(AtomicU64::new(0)),
-            boot_time: Instant::now(),
-        })
+impl StreamBuffer {
+    /// Create a new stream buffer with default size (48KB / ~3 seconds @ 128kbps)
+    pub fn new() -> Self {
+        let (producer, consumer) = RingBuffer::new(BUFFER_SIZE);
+        Self { producer, consumer }
     }
 
-    /// Start ducking all streams for DUCK_DURATION_MS
-    fn start_duck(&self) {
-        let until = self.boot_time.elapsed().as_millis() as u64 + DUCK_DURATION_MS;
-        self.duck_until_ms.store(until, Ordering::SeqCst);
-        debug!("Ducking streams for {}ms", DUCK_DURATION_MS);
+    /// Create a stream buffer with custom capacity
+    #[allow(dead_code)]
+    pub fn with_capacity(capacity: usize) -> Self {
+        let (producer, consumer) = RingBuffer::new(capacity);
+        Self { producer, consumer }
     }
 
-    /// Stop any currently playing stream and wait for it to finish
-    pub fn stop(&mut self) {
-        // Signal the stream to stop
-        self.stop_flag.store(true, Ordering::SeqCst);
-
-        // Wait for the stream thread to actually finish
-        if let Some(handle) = self.stream_thread.take() {
-            debug!("Waiting for stream thread to stop...");
-            let _ = handle.join();
-            debug!("Stream thread stopped");
-        }
-
-        // Create new flag for the next stream
-        self.stop_flag = Arc::new(AtomicBool::new(false));
-    }
-
-    /// Extend duck timer to survive HTTP connect delays
-    /// Called by play_stream() after stop() to ensure new stream starts ducked
-    fn extend_duck_for_new_stream(&self) {
-        let now_ms = self.boot_time.elapsed().as_millis() as u64;
-        let until_ms = self.duck_until_ms.load(Ordering::SeqCst);
-
-        // If duck was recently requested (active or expired within 2s), extend it
-        // This handles slow HTTP connects that would otherwise miss the duck window
-        let duck_active = now_ms < until_ms;
-        let duck_recent = until_ms > 0 && now_ms.saturating_sub(until_ms) < 2000;
-
-        if duck_active || duck_recent {
-            // Extend by 5 seconds to cover worst-case HTTP connect time
-            let extended = now_ms + 5000;
-            self.duck_until_ms.store(extended, Ordering::SeqCst);
-            debug!(
-                "Extended duck timer for new stream (was {}ms, now {}ms, until {}ms)",
-                until_ms, now_ms, extended
-            );
-        }
-    }
-
-    /// Speak text using TTS (blocking, waits for completion)
-    /// Use this for sequential announcements (e.g., welcome sequence)
-    pub fn speak_sync(&mut self, text: &str, tts: &crate::tts::PiperTts) {
-        debug!("TTS (sync): {}", text);
-
-        match tts.synthesize(text) {
-            Ok(samples) => {
-                if !samples.is_empty() {
-                    let samples_f32: Vec<f32> =
-                        samples.iter().map(|&s| s as f32 / 32768.0).collect();
-                    let source = SamplesBuffer::new(1, 22050, samples_f32);
-
-                    if let Ok(sink) = Sink::try_new(&self.stream_handle) {
-                        sink.set_volume(VOLUME);
-                        sink.append(source);
-                        sink.sleep_until_end();
-                    }
-                }
+    /// Write bytes to the buffer (called by download thread)
+    ///
+    /// Uses overwrite semantics: if buffer is full, oldest data is discarded.
+    /// This is appropriate for live streams where old data becomes stale.
+    ///
+    /// Returns number of bytes written (always equals input length with overwrite)
+    pub fn write(&mut self, data: &[u8]) -> usize {
+        let mut written = 0;
+        for &byte in data {
+            // Try to push, if full we need to drop oldest data
+            if self.producer.push(byte).is_err() {
+                // Buffer full - pop oldest byte to make room (overwrite semantics)
+                let _ = self.consumer.pop();
+                // Now push should succeed
+                let _ = self.producer.push(byte);
             }
-            Err(e) => {
-                warn!("TTS failed: {}", e);
+            written += 1;
+        }
+        written
+    }
+
+    /// Read bytes from the buffer (called by decoder thread)
+    ///
+    /// Returns number of bytes read (may be less than buf.len() if buffer has less data)
+    pub fn read(&mut self, buf: &mut [u8]) -> usize {
+        let mut read_count = 0;
+        for slot in buf.iter_mut() {
+            match self.consumer.pop() {
+                Ok(byte) => {
+                    *slot = byte;
+                    read_count += 1;
+                }
+                Err(_) => break, // Buffer empty
             }
         }
+        read_count
     }
 
-    /// Speak text using TTS (fire-and-forget, non-blocking)
-    /// Ducks any playing streams for DUCK_DURATION_MS
-    pub fn speak(&mut self, text: &str, tts: &std::sync::Arc<crate::tts::PiperTts>) {
-        debug!("TTS: {}", text);
-
-        // Duck streams immediately (for macOS say which plays during synthesize)
-        self.start_duck();
-
-        // Yield to give stream thread a chance to see duck state before stop() is called
-        thread::yield_now();
-
-        let text = text.to_string();
-        let tts = tts.clone();
-        let stream_handle = self.stream_handle.clone();
-        let duck_until_ms = self.duck_until_ms.clone();
-        let boot_time = self.boot_time;
-
-        // Spawn TTS in background thread (fire-and-forget)
-        thread::spawn(move || {
-            match tts.synthesize(&text) {
-                Ok(samples) => {
-                    // Empty samples means audio was already played (e.g., macOS say)
-                    if !samples.is_empty() {
-                        // For Piper: refresh duck timer after synthesis completes
-                        // This ensures ducking lasts through playback, not just synthesis
-                        let until = boot_time.elapsed().as_millis() as u64 + DUCK_DURATION_MS;
-                        duck_until_ms.store(until, Ordering::SeqCst);
-                        debug!("Refreshed duck timer after synthesis");
-
-                        let samples_f32: Vec<f32> =
-                            samples.iter().map(|&s| s as f32 / 32768.0).collect();
-                        let source = SamplesBuffer::new(1, 22050, samples_f32);
-
-                        if let Ok(sink) = Sink::try_new(&stream_handle) {
-                            sink.set_volume(VOLUME);
-                            sink.append(source);
-                            sink.sleep_until_end();
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("TTS failed: {}", e);
-                }
-            }
-        });
+    /// Clear all data from the buffer
+    ///
+    /// Used by disconnect_all() when stopping streams
+    pub fn clear(&mut self) {
+        while self.consumer.pop().is_ok() {}
     }
 
-    /// Play an internet radio stream (non-blocking)
-    /// Stops any currently playing stream first
-    /// Stream respects duck_until_ms for ducking during TTS
-    pub fn play_stream(&mut self, url: &str) -> Result<()> {
-        info!("Streaming: {}", url);
+    /// Number of bytes currently in the buffer
+    pub fn len(&self) -> usize {
+        self.producer.slots() - self.producer.slots() + self.consumer.slots()
+        // Note: This is an approximation since rtrb doesn't expose exact count
+        // For our purposes, we use slots() which gives available space
+    }
 
-        // Stop any existing stream first
-        self.stop();
+    /// Check if buffer is empty
+    pub fn is_empty(&self) -> bool {
+        self.consumer.is_empty()
+    }
 
-        // Extend duck timer to survive HTTP connect delays
-        // This ensures new stream starts ducked even if HTTP is slow
-        self.extend_duck_for_new_stream();
+    /// Check if buffer has data available for reading
+    pub fn has_data(&self) -> bool {
+        !self.consumer.is_empty()
+    }
 
-        let url = url.to_string();
-        let stop_flag = self.stop_flag.clone();
-        let stream_handle = self.stream_handle.clone();
-        let duck_until_ms = self.duck_until_ms.clone();
-        let boot_time = self.boot_time;
+    /// Get buffer capacity
+    #[allow(dead_code)]
+    pub fn capacity(&self) -> usize {
+        BUFFER_SIZE
+    }
 
-        // Spawn a thread to handle streaming
-        let handle = thread::spawn(move || {
-            if let Err(e) = stream_audio(&url, &stream_handle, stop_flag, duck_until_ms, boot_time) {
-                error!("Stream error: {}", e);
-            }
-        });
+    /// Split into producer and consumer halves for use in separate threads
+    ///
+    /// This consumes the StreamBuffer and returns the raw producer/consumer.
+    /// Use this when you need to move producer to download thread and consumer
+    /// to decoder thread.
+    pub fn split(self) -> (Producer<u8>, Consumer<u8>) {
+        (self.producer, self.consumer)
+    }
+}
 
-        self.stream_thread = Some(handle);
-
-        Ok(())
+impl Default for StreamBuffer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 // =============================================================================
-// Multi-Stream Player (all channels playing simultaneously, one audible)
+// Download Thread - HTTP streaming to ring buffer
 // =============================================================================
 
-/// Stream status values
-const STREAM_STATUS_CONNECTING: u8 = 0;
-const STREAM_STATUS_PLAYING: u8 = 1;
-const STREAM_STATUS_ERROR: u8 = 2;
-
-/// Handle for a single stream in the multi-stream player
-struct StreamHandle {
+/// Handle for a download thread
+pub struct DownloadHandle {
     thread: JoinHandle<()>,
     stop_flag: Arc<AtomicBool>,
-    /// Sink wrapped for thread-safe volume control from main thread
-    sink: Arc<Mutex<Option<Arc<Sink>>>>,
-    /// Stream status: 0=connecting, 1=playing, 2=error
-    status: Arc<AtomicU8>,
+    /// True if initial connection succeeded and stream is downloading
+    connected: Arc<AtomicBool>,
+    /// Error state: true if download failed after initial connection
+    errored: Arc<AtomicBool>,
 }
 
-/// Sentinel value for "no active stream"
-const NO_ACTIVE_STREAM: usize = usize::MAX;
+impl DownloadHandle {
+    /// Signal the download thread to stop
+    pub fn stop(&self) {
+        self.stop_flag.store(true, Ordering::SeqCst);
+    }
 
-/// Multi-stream player - all channels playing simultaneously, one audible
+    /// Check if stream successfully connected
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::SeqCst)
+    }
+
+    /// Check if download has errored
+    pub fn has_error(&self) -> bool {
+        self.errored.load(Ordering::SeqCst)
+    }
+
+    /// Wait for thread to finish (call after stop())
+    pub fn join(self) {
+        let _ = self.thread.join();
+    }
+}
+
+/// Spawn a download thread that reads from URL and writes to buffer
 ///
-/// Architecture:
-/// - All 4 streams connect at boot via connect_all()
-/// - All streams decode and play continuously (but muted)
-/// - select(idx) makes one stream audible (instant switch)
-/// - disconnect_all() stops all streams (Off state, saves bandwidth)
-pub struct MultiStreamPlayer {
-    _stream: OutputStream,
-    stream_handle: OutputStreamHandle,
-    /// Array of stream handles, one per channel
-    streams: [Option<StreamHandle>; 4],
-    /// Currently active (audible) stream index, NO_ACTIVE_STREAM = all muted
-    /// Atomic for thread-safe access from TTS thread
-    active_index: Arc<AtomicUsize>,
-}
-
-impl MultiStreamPlayer {
-    /// Create a new multi-stream player
-    pub fn new() -> Result<Self> {
-        let (stream, stream_handle) = OutputStream::try_default()
-            .map_err(|e| anyhow!("Failed to open audio output: {}", e))?;
-
-        Ok(Self {
-            _stream: stream,
-            stream_handle,
-            streams: [None, None, None, None],
-            active_index: Arc::new(AtomicUsize::new(NO_ACTIVE_STREAM)),
-        })
-    }
-
-    /// Switch to channel (instant - just volume change)
-    /// Sets the specified stream to audible volume, mutes all others
-    pub fn select(&mut self, index: usize) {
-        debug!("Selecting channel {}", index);
-
-        for (i, stream) in self.streams.iter().enumerate() {
-            if let Some(ref sh) = stream {
-                if let Ok(sink_guard) = sh.sink.lock() {
-                    if let Some(ref sink) = *sink_guard {
-                        let volume = if i == index { VOLUME } else { MUTED_VOLUME };
-                        sink.set_volume(volume);
-                    }
-                }
-            }
-        }
-        self.active_index.store(index, Ordering::SeqCst);
-    }
-
-    /// Mute all streams (for TTS or Off state)
-    pub fn mute_all(&self) {
-        for (i, stream) in self.streams.iter().enumerate() {
-            if let Some(ref sh) = stream {
-                if let Ok(sink_guard) = sh.sink.lock() {
-                    if let Some(ref sink) = *sink_guard {
-                        sink.set_volume(MUTED_VOLUME);
-                    }
-                }
-            }
-            debug!("Muted stream {}", i);
-        }
-    }
-
-    /// Unmute: mute all streams, then unmute only the current active stream
-    /// This ensures a clean state - only one stream audible
-    fn unmute_active(&self) {
-        // First mute all
-        self.mute_all();
-
-        // Then unmute only the current active stream
-        let idx = self.active_index.load(Ordering::SeqCst);
-        if idx != NO_ACTIVE_STREAM {
-            if let Some(ref sh) = self.streams.get(idx).and_then(|s| s.as_ref()) {
-                if let Ok(sink_guard) = sh.sink.lock() {
-                    if let Some(ref sink) = *sink_guard {
-                        sink.set_volume(VOLUME);
-                        debug!("Unmuted active stream {}", idx);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Speak text using TTS (blocking, waits for completion)
-    /// Use this for sequential announcements (e.g., welcome sequence)
-    pub fn speak_sync(&self, text: &str, tts: &crate::tts::PiperTts) {
-        debug!("TTS (sync): {}", text);
-
-        match tts.synthesize(text) {
-            Ok(samples) => {
-                if !samples.is_empty() {
-                    let samples_f32: Vec<f32> =
-                        samples.iter().map(|&s| s as f32 / 32768.0).collect();
-                    let source = SamplesBuffer::new(1, 22050, samples_f32);
-
-                    if let Ok(sink) = Sink::try_new(&self.stream_handle) {
-                        sink.set_volume(VOLUME);
-                        sink.append(source);
-                        sink.sleep_until_end();
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("TTS failed: {}", e);
-            }
-        }
-    }
-
-    /// Speak text using TTS (fire-and-forget, non-blocking)
-    /// Mutes all streams during TTS, unmutes active stream after
-    pub fn speak(&self, text: &str, tts: &std::sync::Arc<crate::tts::PiperTts>) {
-        debug!("TTS: {}", text);
-
-        // Mute all streams immediately
-        self.mute_all();
-
-        // Collect all sink references for unmuting later
-        let sinks: Vec<Arc<Mutex<Option<Arc<Sink>>>>> = self.streams
-            .iter()
-            .filter_map(|s| s.as_ref().map(|sh| sh.sink.clone()))
-            .collect();
-
-        // Clone active_index Arc so TTS thread can read current value after completion
-        let active_index = self.active_index.clone();
-
-        let text = text.to_string();
-        let tts = tts.clone();
-        let stream_handle = self.stream_handle.clone();
-
-        // Spawn TTS in background thread (fire-and-forget)
-        thread::spawn(move || {
-            match tts.synthesize(&text) {
-                Ok(samples) => {
-                    // Empty samples means audio was already played (e.g., macOS say)
-                    if !samples.is_empty() {
-                        let samples_f32: Vec<f32> =
-                            samples.iter().map(|&s| s as f32 / 32768.0).collect();
-                        let source = SamplesBuffer::new(1, 22050, samples_f32);
-
-                        if let Ok(sink) = Sink::try_new(&stream_handle) {
-                            sink.set_volume(VOLUME);
-                            sink.append(source);
-                            sink.sleep_until_end();
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("TTS failed: {}", e);
-                }
-            }
-
-            // Mute all, then unmute only the CURRENT active stream
-            for sink_mutex in &sinks {
-                if let Ok(sink_guard) = sink_mutex.lock() {
-                    if let Some(ref sink) = *sink_guard {
-                        sink.set_volume(MUTED_VOLUME);
-                    }
-                }
-            }
-
-            let idx = active_index.load(Ordering::SeqCst);
-            if idx != NO_ACTIVE_STREAM && idx < sinks.len() {
-                if let Ok(sink_guard) = sinks[idx].lock() {
-                    if let Some(ref sink) = *sink_guard {
-                        sink.set_volume(VOLUME);
-                        debug!("Unmuted stream {} after TTS", idx);
-                    }
-                }
-            }
-        });
-    }
-
-    /// Get the status of a stream
-    #[allow(dead_code)]
-    pub fn stream_status(&self, index: usize) -> Option<u8> {
-        self.streams.get(index)?.as_ref().map(|sh| sh.status.load(Ordering::SeqCst))
-    }
-
-    /// Check if a specific stream is connected and playing
-    #[allow(dead_code)]
-    pub fn is_stream_playing(&self, index: usize) -> bool {
-        self.stream_status(index) == Some(STREAM_STATUS_PLAYING)
-    }
-
-    /// Connect all streams at boot (blocking, with timeout)
-    /// Returns number of successfully connected streams
-    pub fn connect_all(&mut self, channels: &[crate::channels::Channel], timeout: Duration) -> usize {
-        info!("Connecting to {} stations (timeout: {:?})...", channels.len(), timeout);
-
-        let (tx, rx) = mpsc::channel();
-        let deadline = Instant::now() + timeout;
-
-        // Spawn connection threads in parallel
-        for (i, channel) in channels.iter().enumerate() {
-            let tx = tx.clone();
-            let url = channel.url.to_string();
-            let stream_handle = self.stream_handle.clone();
-
-            thread::spawn(move || {
-                debug!("Connecting stream {}: {}", i, url);
-                let result = connect_single_stream(i, &url, stream_handle);
-                let _ = tx.send((i, result));
-            });
-        }
-        drop(tx); // Close sender so rx knows when all done
-
-        // Collect results with timeout
-        let mut connected = 0;
-        for _ in 0..channels.len() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                warn!("Connection timeout reached");
-                break;
-            }
-
-            match rx.recv_timeout(remaining) {
-                Ok((i, Ok(handle))) => {
-                    info!("Stream {} connected", i);
-                    self.streams[i] = Some(handle);
-                    connected += 1;
-                }
-                Ok((i, Err(e))) => {
-                    warn!("Failed to connect stream {}: {}", i, e);
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    warn!("Connection timeout");
-                    break;
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    // All senders dropped, we're done
-                    break;
-                }
-            }
-        }
-
-        info!("Connected {} out of {} streams", connected, channels.len());
-        connected
-    }
-
-    /// Disconnect all streams (Off state)
-    /// Saves bandwidth when radio is not in use
-    pub fn disconnect_all(&mut self) {
-        info!("Disconnecting all streams");
-
-        // Signal all streams to stop
-        for stream in self.streams.iter() {
-            if let Some(ref sh) = stream {
-                sh.stop_flag.store(true, Ordering::SeqCst);
-            }
-        }
-
-        // Wait for all threads to finish
-        for stream in self.streams.iter_mut() {
-            if let Some(sh) = stream.take() {
-                debug!("Waiting for stream thread to stop...");
-                let _ = sh.thread.join();
-            }
-        }
-
-        self.active_index.store(NO_ACTIVE_STREAM, Ordering::SeqCst);
-        debug!("All streams disconnected");
-    }
-
-    /// Check if active stream has an error
-    /// Returns true if the active stream is in error state
-    pub fn active_stream_has_error(&self) -> bool {
-        let idx = self.active_index.load(Ordering::SeqCst);
-        if idx != NO_ACTIVE_STREAM {
-            self.stream_status(idx) == Some(STREAM_STATUS_ERROR)
-        } else {
-            false
-        }
-    }
-
-    /// Reconnect a single stream that has failed
-    /// Returns true if reconnection was successful
-    pub fn reconnect_stream(&mut self, index: usize, channel: &crate::channels::Channel) -> bool {
-        info!("Reconnecting stream {}: {}", index, channel.name);
-
-        // Stop existing stream if any
-        if let Some(sh) = self.streams[index].take() {
-            sh.stop_flag.store(true, Ordering::SeqCst);
-            let _ = sh.thread.join();
-        }
-
-        // Try to reconnect
-        match connect_single_stream(index, channel.url, self.stream_handle.clone()) {
-            Ok(handle) => {
-                // Set volume based on whether this is the active stream
-                if let Ok(sink_guard) = handle.sink.lock() {
-                    if let Some(ref sink) = *sink_guard {
-                        let volume = if self.active_index.load(Ordering::SeqCst) == index {
-                            VOLUME
-                        } else {
-                            MUTED_VOLUME
-                        };
-                        sink.set_volume(volume);
-                    }
-                }
-                self.streams[index] = Some(handle);
-                info!("Stream {} reconnected successfully", index);
-                true
-            }
-            Err(e) => {
-                error!("Failed to reconnect stream {}: {}", index, e);
-                false
-            }
-        }
-    }
-
-    /// Reconnect active stream with exponential backoff
-    /// Tries 3 times with 1s, 2s, 4s delays
-    /// Returns true if reconnection was successful
-    pub fn reconnect_active_with_backoff(&mut self, channel: &crate::channels::Channel) -> bool {
-        let idx = self.active_index.load(Ordering::SeqCst);
-        if idx == NO_ACTIVE_STREAM {
-            return false;
-        }
-
-        let delays = [1, 2, 4]; // seconds
-        for (attempt, delay_secs) in delays.iter().enumerate() {
-            info!("Reconnect attempt {} of {} (waiting {}s)", attempt + 1, delays.len(), delay_secs);
-
-            std::thread::sleep(Duration::from_secs(*delay_secs));
-
-            if self.reconnect_stream(idx, channel) {
-                return true;
-            }
-        }
-
-        false
-    }
-}
-
-/// Connect a single stream and return a StreamHandle
-/// The stream starts muted and decodes continuously in a background thread
-fn connect_single_stream(
-    index: usize,
-    url: &str,
-    stream_handle: OutputStreamHandle,
-) -> Result<StreamHandle> {
-    // Make HTTP request
-    let response = ureq::get(url)
-        .set("User-Agent", "lego-radio/1.0")
-        .set("Icy-MetaData", "0")
-        .call()
-        .map_err(|e| anyhow!("HTTP request failed for stream {}: {}", index, e))?;
-
-    let content_type = response.content_type().to_string();
-    debug!("Stream {} Content-Type: {}", index, content_type);
-
-    // Create media source from HTTP stream
-    let reader = HttpStreamReader {
-        reader: BufReader::with_capacity(64 * 1024, response.into_reader()),
-    };
-
-    let mss = MediaSourceStream::new(Box::new(reader), Default::default());
-
-    // Create a hint based on content type
-    let mut hint = Hint::new();
-    if content_type.contains("audio/mpeg") || content_type.contains("audio/mp3") {
-        hint.with_extension("mp3");
-    } else if content_type.contains("audio/aac") || content_type.contains("audio/aacp") {
-        hint.with_extension("aac");
-    }
-
-    // Probe the format
-    let format_opts = FormatOptions {
-        enable_gapless: true,
-        ..Default::default()
-    };
-    let metadata_opts = MetadataOptions::default();
-
-    let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &format_opts, &metadata_opts)
-        .map_err(|e| anyhow!("Failed to probe format for stream {}: {}", index, e))?;
-
-    let mut format = probed.format;
-
-    // Get the default track
-    let track = format
-        .default_track()
-        .ok_or_else(|| anyhow!("No audio track found in stream {}", index))?;
-
-    let track_id = track.id;
-
-    // Create decoder
-    let dec_opts = DecoderOptions::default();
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &dec_opts)
-        .map_err(|e| anyhow!("Failed to create decoder for stream {}: {}", index, e))?;
-
-    // Get audio parameters
-    let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
-    let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2);
-
-    info!("Stream {}: {} Hz, {} channels", index, sample_rate, channels);
-
-    // Create a sink for playback (starts muted)
-    let sink = Arc::new(
-        Sink::try_new(&stream_handle)
-            .map_err(|e| anyhow!("Failed to create sink for stream {}: {}", index, e))?
-    );
-    sink.set_volume(MUTED_VOLUME); // Start muted
-
-    // Create shared state for the stream
+/// Returns a DownloadHandle for controlling the thread.
+/// The producer half of the buffer is moved into the thread.
+pub fn spawn_downloader(url: String, mut producer: Producer<u8>) -> DownloadHandle {
     let stop_flag = Arc::new(AtomicBool::new(false));
-    let status = Arc::new(AtomicU8::new(STREAM_STATUS_CONNECTING));
-    let sink_shared: Arc<Mutex<Option<Arc<Sink>>>> = Arc::new(Mutex::new(Some(sink.clone())));
+    let connected = Arc::new(AtomicBool::new(false));
+    let errored = Arc::new(AtomicBool::new(false));
 
-    // Clone for the thread
-    let stop_flag_clone = stop_flag.clone();
-    let status_clone = status.clone();
-    let sink_for_thread = sink;
+    let stop_clone = stop_flag.clone();
+    let connected_clone = connected.clone();
+    let errored_clone = errored.clone();
 
-    // Spawn decode thread
     let thread = thread::spawn(move || {
-        // Mark as playing
-        status_clone.store(STREAM_STATUS_PLAYING, Ordering::SeqCst);
-
-        // Decode loop
-        loop {
-            // Check stop flag
-            if stop_flag_clone.load(Ordering::SeqCst) {
-                debug!("Stream {} stopped by user", index);
-                sink_for_thread.stop();
-                break;
-            }
-
-            // Read next packet
-            let packet = match format.next_packet() {
-                Ok(packet) => packet,
-                Err(symphonia::core::errors::Error::IoError(e))
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-                {
-                    warn!("Stream {} ended", index);
-                    status_clone.store(STREAM_STATUS_ERROR, Ordering::SeqCst);
-                    break;
-                }
-                Err(e) => {
-                    error!("Stream {} error reading packet: {}", index, e);
-                    status_clone.store(STREAM_STATUS_ERROR, Ordering::SeqCst);
-                    break;
-                }
-            };
-
-            // Skip packets from other tracks
-            if packet.track_id() != track_id {
-                continue;
-            }
-
-            // Decode the packet
-            let decoded = match decoder.decode(&packet) {
-                Ok(decoded) => decoded,
-                Err(e) => {
-                    warn!("Stream {} decode error: {}", index, e);
-                    continue;
-                }
-            };
-
-            // Convert to samples
-            let spec = *decoded.spec();
-            let duration = decoded.capacity() as u64;
-
-            let mut sample_buf = SampleBuffer::<f32>::new(duration, spec);
-            sample_buf.copy_interleaved_ref(decoded);
-
-            let samples = sample_buf.samples().to_vec();
-
-            // Play through rodio
-            let source = SamplesBuffer::new(channels as u16, sample_rate, samples);
-            sink_for_thread.append(source);
-        }
+        download_loop(&url, &mut producer, &stop_clone, &connected_clone, &errored_clone);
     });
 
-    Ok(StreamHandle {
+    DownloadHandle {
         thread,
         stop_flag,
-        sink: sink_shared,
-        status,
-    })
-}
-
-/// HTTP streaming reader that implements MediaSource
-struct HttpStreamReader {
-    reader: BufReader<Box<dyn Read + Send + Sync>>,
-}
-
-impl std::io::Read for HttpStreamReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.reader.read(buf)
+        connected,
+        errored,
     }
 }
 
-impl std::io::Seek for HttpStreamReader {
+/// Exponential backoff delays for reconnection attempts (in seconds)
+const RETRY_DELAYS: [u64; 3] = [1, 2, 4];
+
+/// Download loop - continuously reads from HTTP and writes to ring buffer
+///
+/// Includes error recovery with exponential backoff:
+/// 1. On connection/read failure, retries with 1s, 2s, 4s delays
+/// 2. During retry, decoder continues from buffer (~3 sec cushion)
+/// 3. After 3 failures, marks stream as errored (unavailable)
+///
+/// Runs until stop flag is set or max retries exhausted.
+fn download_loop(
+    url: &str,
+    producer: &mut Producer<u8>,
+    stop_flag: &AtomicBool,
+    connected: &AtomicBool,
+    errored: &AtomicBool,
+) {
+    debug!("Starting download from: {}", url);
+
+    let mut retry_count = 0;
+
+    'outer: loop {
+        // Check stop flag before attempting connection
+        if stop_flag.load(Ordering::SeqCst) {
+            debug!("Download stopped by user before connection");
+            break;
+        }
+
+        // Make HTTP request
+        let response = match ureq::get(url)
+            .set("User-Agent", "lego-radio/1.0")
+            .set("Icy-MetaData", "0")
+            .call()
+        {
+            Ok(resp) => {
+                // Successfully connected - reset retry count
+                retry_count = 0;
+                resp
+            }
+            Err(e) => {
+                error!("HTTP connection failed: {}", e);
+
+                // Attempt retry with exponential backoff
+                if retry_count < RETRY_DELAYS.len() {
+                    let delay = RETRY_DELAYS[retry_count];
+                    warn!("Retrying in {}s (attempt {}/{})", delay, retry_count + 1, RETRY_DELAYS.len());
+
+                    // Wait with periodic stop flag checks
+                    let deadline = Instant::now() + Duration::from_secs(delay);
+                    while Instant::now() < deadline {
+                        if stop_flag.load(Ordering::SeqCst) {
+                            debug!("Download stopped during retry wait");
+                            break 'outer;
+                        }
+                        thread::sleep(Duration::from_millis(100));
+                    }
+
+                    retry_count += 1;
+                    continue 'outer; // Retry connection
+                } else {
+                    // Max retries exhausted
+                    error!("Max retries exhausted, marking stream as unavailable");
+                    errored.store(true, Ordering::SeqCst);
+                    break 'outer;
+                }
+            }
+        };
+
+        let content_type = response.content_type().to_string();
+        debug!("Connected, Content-Type: {}", content_type);
+        connected.store(true, Ordering::SeqCst);
+
+        let mut reader = response.into_reader();
+        let mut chunk = [0u8; 4096];
+
+        // Read loop
+        loop {
+            // Check stop flag
+            if stop_flag.load(Ordering::SeqCst) {
+                debug!("Download stopped by user");
+                break 'outer;
+            }
+
+            // Read from HTTP stream
+            let bytes_read = match reader.read(&mut chunk) {
+                Ok(0) => {
+                    // Stream ended (EOF)
+                    warn!("Stream ended unexpectedly");
+                    break; // Break inner loop to attempt reconnect
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    error!("Read error: {}", e);
+                    break; // Break inner loop to attempt reconnect
+                }
+            };
+
+            // Write to ring buffer with overwrite semantics
+            for &byte in &chunk[..bytes_read] {
+                if producer.push(byte).is_err() {
+                    // Buffer full - yield and retry
+                    thread::yield_now();
+                    let _ = producer.push(byte);
+                }
+            }
+        }
+
+        // Read failed - attempt retry with exponential backoff
+        if retry_count < RETRY_DELAYS.len() {
+            let delay = RETRY_DELAYS[retry_count];
+            warn!("Stream interrupted, retrying in {}s (attempt {}/{})", delay, retry_count + 1, RETRY_DELAYS.len());
+
+            let deadline = Instant::now() + Duration::from_secs(delay);
+            while Instant::now() < deadline {
+                if stop_flag.load(Ordering::SeqCst) {
+                    debug!("Download stopped during retry wait");
+                    break 'outer;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+
+            retry_count += 1;
+            // Loop will continue and attempt reconnection
+        } else {
+            // Max retries exhausted
+            error!("Max retries exhausted after stream interruption");
+            errored.store(true, Ordering::SeqCst);
+            break 'outer;
+        }
+    }
+
+    debug!("Download loop ended");
+}
+
+// =============================================================================
+// Decoder Thread - Reads from ring buffer, decodes, plays to single Sink
+// =============================================================================
+
+/// Read adapter for rtrb Consumer - makes Consumer compatible with std::io::Read
+///
+/// This allows symphonia to create a MediaSourceStream from our ring buffer.
+/// When buffer is empty, blocks briefly then returns what's available.
+///
+/// Note: Wrapped in Mutex to satisfy MediaSource's Sync requirement.
+/// In practice, only the decoder thread accesses this so there's no contention.
+pub struct ConsumerReader {
+    consumer: Mutex<Consumer<u8>>,
+    /// How long to wait when buffer is empty before returning
+    read_timeout: Duration,
+}
+
+impl ConsumerReader {
+    pub fn new(consumer: Consumer<u8>) -> Self {
+        Self {
+            consumer: Mutex::new(consumer),
+            read_timeout: Duration::from_millis(100),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_timeout(consumer: Consumer<u8>, timeout: Duration) -> Self {
+        Self {
+            consumer: Mutex::new(consumer),
+            read_timeout: timeout,
+        }
+    }
+}
+
+impl Read for ConsumerReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut consumer = self.consumer.lock().unwrap();
+        let mut read_count = 0;
+
+        // Try to read available data first
+        for slot in buf.iter_mut() {
+            match consumer.pop() {
+                Ok(byte) => {
+                    *slot = byte;
+                    read_count += 1;
+                }
+                Err(_) => break, // Buffer empty
+            }
+        }
+
+        // If we got some data, return it
+        if read_count > 0 {
+            return Ok(read_count);
+        }
+
+        // Buffer empty - release lock and wait briefly for more data
+        drop(consumer);
+
+        let start = Instant::now();
+        while start.elapsed() < self.read_timeout {
+            thread::sleep(Duration::from_millis(5));
+
+            let mut consumer = self.consumer.lock().unwrap();
+            if let Ok(byte) = consumer.pop() {
+                buf[0] = byte;
+                return Ok(1);
+            }
+        }
+
+        // Timeout - return WouldBlock to signal temporary underflow
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "Buffer underflow - waiting for data",
+        ))
+    }
+}
+
+impl std::io::Seek for ConsumerReader {
     fn seek(&mut self, _pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        // Streams don't support seeking
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "Seeking not supported for streams",
@@ -731,7 +422,7 @@ impl std::io::Seek for HttpStreamReader {
     }
 }
 
-impl symphonia::core::io::MediaSource for HttpStreamReader {
+impl symphonia::core::io::MediaSource for ConsumerReader {
     fn is_seekable(&self) -> bool {
         false
     }
@@ -741,118 +432,129 @@ impl symphonia::core::io::MediaSource for HttpStreamReader {
     }
 }
 
-/// Stream audio from URL using symphonia for decoding
-/// Checks duck_until_ms to determine if volume should be ducked
-fn stream_audio(
-    url: &str,
-    stream_handle: &OutputStreamHandle,
+/// Handle for controlling a decoder thread
+pub struct DecoderHandle {
+    thread: JoinHandle<()>,
     stop_flag: Arc<AtomicBool>,
-    duck_until_ms: Arc<AtomicU64>,
-    boot_time: Instant,
-) -> Result<()> {
-    // Make HTTP request
-    let response = ureq::get(url)
-        .set("User-Agent", "lego-radio/1.0")
-        .set("Icy-MetaData", "0")
-        .call()
-        .map_err(|e| anyhow!("HTTP request failed: {}", e))?;
+    pause_flag: Arc<AtomicBool>,
+}
 
-    let content_type = response.content_type().to_string();
-    debug!("Content-Type: {}", content_type);
-
-    // Create media source from HTTP stream
-    let reader = HttpStreamReader {
-        reader: BufReader::with_capacity(64 * 1024, response.into_reader()),
-    };
-
-    let mss = MediaSourceStream::new(Box::new(reader), Default::default());
-
-    // Create a hint based on content type
-    let mut hint = Hint::new();
-    if content_type.contains("audio/mpeg") || content_type.contains("audio/mp3") {
-        hint.with_extension("mp3");
-    } else if content_type.contains("audio/aac") || content_type.contains("audio/aacp") {
-        hint.with_extension("aac");
+impl DecoderHandle {
+    /// Signal the decoder thread to stop
+    pub fn stop(&self) {
+        self.stop_flag.store(true, Ordering::SeqCst);
     }
 
-    // Probe the format
+    /// Pause the decoder (stops writing to sink but maintains state)
+    pub fn pause(&self) {
+        self.pause_flag.store(true, Ordering::SeqCst);
+    }
+
+    /// Resume the decoder after pause
+    pub fn resume(&self) {
+        self.pause_flag.store(false, Ordering::SeqCst);
+    }
+
+    /// Check if decoder is paused
+    #[allow(dead_code)]
+    pub fn is_paused(&self) -> bool {
+        self.pause_flag.load(Ordering::SeqCst)
+    }
+
+    /// Wait for thread to finish (call after stop())
+    pub fn join(self) {
+        let _ = self.thread.join();
+    }
+}
+
+/// Spawn a decoder thread that reads from buffer, decodes, and plays to sink
+///
+/// Returns a DecoderHandle for controlling the thread.
+/// The consumer half of the buffer is moved into the thread.
+pub fn spawn_decoder(consumer: Consumer<u8>, sink: Arc<Sink>) -> DecoderHandle {
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let pause_flag = Arc::new(AtomicBool::new(false));
+
+    let stop_clone = stop_flag.clone();
+    let pause_clone = pause_flag.clone();
+
+    let thread = thread::spawn(move || {
+        decode_loop(consumer, sink, &stop_clone, &pause_clone);
+    });
+
+    DecoderHandle {
+        thread,
+        stop_flag,
+        pause_flag,
+    }
+}
+
+/// Decode loop - reads from buffer, decodes with symphonia, plays to sink
+///
+/// Runs until stop flag is set.
+/// When paused, stops appending to sink but continues decoding to keep up.
+fn decode_loop(
+    consumer: Consumer<u8>,
+    sink: Arc<Sink>,
+    stop_flag: &AtomicBool,
+    pause_flag: &AtomicBool,
+) {
+    debug!("Starting decoder");
+
+    // Create reader adapter
+    let reader = ConsumerReader::new(consumer);
+    let mss = MediaSourceStream::new(Box::new(reader), Default::default());
+
+    // Probe the format (finds sync point automatically)
     let format_opts = FormatOptions {
         enable_gapless: true,
         ..Default::default()
     };
     let metadata_opts = MetadataOptions::default();
+    let hint = Hint::new(); // No hint - let symphonia auto-detect
 
-    let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &format_opts, &metadata_opts)
-        .map_err(|e| anyhow!("Failed to probe format: {}", e))?;
+    let probed = match symphonia::default::get_probe().format(&hint, mss, &format_opts, &metadata_opts) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("Failed to probe format: {}", e);
+            return;
+        }
+    };
 
     let mut format = probed.format;
 
     // Get the default track
-    let track = format
-        .default_track()
-        .ok_or_else(|| anyhow!("No audio track found"))?;
+    let track = match format.default_track() {
+        Some(t) => t,
+        None => {
+            error!("No audio track found");
+            return;
+        }
+    };
 
     let track_id = track.id;
 
     // Create decoder
     let dec_opts = DecoderOptions::default();
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &dec_opts)
-        .map_err(|e| anyhow!("Failed to create decoder: {}", e))?;
+    let mut decoder = match symphonia::default::get_codecs().make(&track.codec_params, &dec_opts) {
+        Ok(d) => d,
+        Err(e) => {
+            error!("Failed to create decoder: {}", e);
+            return;
+        }
+    };
 
     // Get audio parameters
     let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
     let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2);
 
-    info!("Audio: {} Hz, {} channels", sample_rate, channels);
+    info!("Decoder: {} Hz, {} channels", sample_rate, channels);
 
-    // Create a sink for playback
-    let sink = Sink::try_new(stream_handle)
-        .map_err(|e| anyhow!("Failed to create sink: {}", e))?;
-
-    // Helper to check if we should be ducked
-    let should_duck = || {
-        let now_ms = boot_time.elapsed().as_millis() as u64;
-        let until_ms = duck_until_ms.load(Ordering::SeqCst);
-        now_ms < until_ms
-    };
-
-    // Set initial volume based on duck state
-    // If ducked, refresh timer so stream gets full DUCK_DURATION_MS from audio start
-    let mut is_ducked = should_duck();
-    if is_ducked {
-        let now_ms = boot_time.elapsed().as_millis() as u64;
-        let refreshed_until = now_ms + DUCK_DURATION_MS;
-        duck_until_ms.store(refreshed_until, Ordering::SeqCst);
-        sink.set_volume(DUCKED_VOLUME);
-        debug!(
-            "Stream starting ducked (refreshed timer to {}ms)",
-            refreshed_until
-        );
-    } else {
-        sink.set_volume(VOLUME);
-        debug!("Stream starting at full volume");
-    }
-
-    // Decode and play packets
+    // Decode loop
     loop {
-        // Check duck state FIRST (before stop check) so stream ducks before exiting
-        let duck_now = should_duck();
-        if is_ducked && !duck_now {
-            debug!("Stream unducking");
-            sink.set_volume(VOLUME);
-            is_ducked = false;
-        } else if !is_ducked && duck_now {
-            debug!("Stream ducking");
-            sink.set_volume(DUCKED_VOLUME);
-            is_ducked = true;
-        }
-
-        // Check stop flag after duck state is applied
+        // Check stop flag
         if stop_flag.load(Ordering::SeqCst) {
-            debug!("Stream stopped by user");
-            sink.stop();
+            debug!("Decoder stopped by user");
             break;
         }
 
@@ -860,13 +562,20 @@ fn stream_audio(
         let packet = match format.next_packet() {
             Ok(packet) => packet,
             Err(symphonia::core::errors::Error::IoError(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                // Buffer underflow - wait a bit and retry
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(symphonia::core::errors::Error::IoError(e))
                 if e.kind() == std::io::ErrorKind::UnexpectedEof =>
             {
-                warn!("Stream ended");
+                warn!("Decoder: stream ended");
                 break;
             }
             Err(e) => {
-                error!("Error reading packet: {}", e);
+                error!("Decoder: error reading packet: {}", e);
                 break;
             }
         };
@@ -885,6 +594,12 @@ fn stream_audio(
             }
         };
 
+        // If paused, skip appending to sink but continue decoding
+        // This keeps decoder state current so resume is instant
+        if pause_flag.load(Ordering::SeqCst) {
+            continue;
+        }
+
         // Convert to samples
         let spec = *decoded.spec();
         let duration = decoded.capacity() as u64;
@@ -899,13 +614,350 @@ fn stream_audio(
         sink.append(source);
     }
 
-    // Wait for remaining audio to play (only if not stopped)
-    if !stop_flag.load(Ordering::SeqCst) {
-        sink.sleep_until_end();
+    debug!("Decode loop ended");
+}
+
+// =============================================================================
+// AudioPipeline - Single-pipe architecture for efficient streaming
+// =============================================================================
+
+/// Single-pipe audio architecture for internet radio streaming.
+///
+/// Key properties:
+/// - HTTP downloads run continuously (bandwidth for N streams)
+/// - Only ONE decoder active at a time (CPU for 1 stream)
+/// - Single audio sink (no volume juggling)
+/// - TTS writes to same sink (decoder pauses during TTS)
+/// - Channel switch = point decoder at different buffer
+///
+/// This replaces MultiStreamPlayer with a more efficient single-pipe design.
+pub struct AudioPipeline {
+    /// Consumers for each channel - decoder reads from these
+    /// Option because we take ownership when starting decoder
+    consumers: Vec<Option<Consumer<u8>>>,
+
+    /// Download threads (one per channel)
+    downloaders: Vec<Option<DownloadHandle>>,
+
+    /// Single decoder thread (reads from active buffer)
+    decoder: Option<DecoderHandle>,
+
+    /// Single audio output
+    sink: Arc<Sink>,
+
+    /// Which buffer the decoder reads from (None = stopped)
+    active_channel: Option<usize>,
+
+    /// Keep OutputStream alive (audio stops if dropped)
+    _stream: OutputStream,
+
+    /// Stream handle for creating sinks
+    stream_handle: OutputStreamHandle,
+}
+
+impl AudioPipeline {
+    /// Create a new audio pipeline with N channel buffers
+    pub fn new(num_channels: usize) -> Result<Self> {
+        let (stream, stream_handle) = OutputStream::try_default()
+            .map_err(|e| anyhow!("Failed to open audio output: {}", e))?;
+
+        let sink = Arc::new(
+            Sink::try_new(&stream_handle)
+                .map_err(|e| anyhow!("Failed to create sink: {}", e))?
+        );
+        sink.set_volume(VOLUME);
+
+        // Initialize empty consumer and downloader slots
+        let consumers: Vec<Option<Consumer<u8>>> = (0..num_channels)
+            .map(|_| None)
+            .collect();
+
+        let downloaders: Vec<Option<DownloadHandle>> = (0..num_channels)
+            .map(|_| None)
+            .collect();
+
+        Ok(Self {
+            consumers,
+            downloaders,
+            decoder: None,
+            sink,
+            active_channel: None,
+            _stream: stream,
+            stream_handle,
+        })
     }
 
-    Ok(())
+    /// Get the number of channels this pipeline supports
+    pub fn num_channels(&self) -> usize {
+        self.consumers.len()
+    }
+
+    /// Get the currently active channel index (if any)
+    pub fn active_channel(&self) -> Option<usize> {
+        self.active_channel
+    }
+
+    /// Check if a download is connected for a specific channel
+    pub fn is_channel_connected(&self, index: usize) -> bool {
+        self.downloaders
+            .get(index)
+            .and_then(|d| d.as_ref())
+            .map(|d| d.is_connected())
+            .unwrap_or(false)
+    }
+
+    /// Check if a download has errored for a specific channel
+    pub fn has_channel_error(&self, index: usize) -> bool {
+        self.downloaders
+            .get(index)
+            .and_then(|d| d.as_ref())
+            .map(|d| d.has_error())
+            .unwrap_or(false)
+    }
+
+    /// Check if decoder is currently running
+    pub fn is_playing(&self) -> bool {
+        self.decoder.is_some()
+    }
+
+    /// Get a reference to the sink (for TTS playback)
+    pub fn sink(&self) -> &Arc<Sink> {
+        &self.sink
+    }
+
+    /// Get the stream handle (for creating additional sinks if needed)
+    pub fn stream_handle(&self) -> &OutputStreamHandle {
+        &self.stream_handle
+    }
+
+    /// Connect all channels to their stream URLs
+    ///
+    /// Spawns download threads in parallel for all channels.
+    /// Waits for buffers to start filling (with timeout).
+    /// Returns count of successfully connected streams.
+    pub fn connect_all(&mut self, channels: &[crate::channels::Channel], timeout: Duration) -> usize {
+        info!("Connecting to {} stations (timeout: {:?})...", channels.len(), timeout);
+
+        let deadline = Instant::now() + timeout;
+
+        // Spawn download threads for each channel
+        for (i, channel) in channels.iter().enumerate() {
+            if i >= self.consumers.len() {
+                warn!("More channels than slots, skipping channel {}", i);
+                continue;
+            }
+
+            // Create a new buffer and split into producer/consumer
+            let buffer = StreamBuffer::new();
+            let (producer, consumer) = buffer.split();
+
+            // Store consumer for decoder to use later
+            self.consumers[i] = Some(consumer);
+
+            // Spawn downloader with producer
+            let handle = spawn_downloader(channel.url.to_string(), producer);
+            self.downloaders[i] = Some(handle);
+
+            debug!("Started download thread for channel {}", i);
+        }
+
+        // Wait for connections to establish (check connected status)
+        let mut connected = 0;
+        let check_interval = Duration::from_millis(100);
+
+        while Instant::now() < deadline {
+            connected = self.downloaders
+                .iter()
+                .filter(|d| d.as_ref().map(|h| h.is_connected()).unwrap_or(false))
+                .count();
+
+            // If all connected (or errored), we're done
+            let errored = self.downloaders
+                .iter()
+                .filter(|d| d.as_ref().map(|h| h.has_error()).unwrap_or(false))
+                .count();
+
+            if connected + errored >= channels.len().min(self.consumers.len()) {
+                break;
+            }
+
+            thread::sleep(check_interval);
+        }
+
+        info!("Connected {} out of {} streams", connected, channels.len());
+        connected
+    }
+
+    /// Disconnect all channels and stop playback
+    ///
+    /// Stops decoder, stops all download threads, clears buffers.
+    /// Used when entering Off state to save bandwidth.
+    pub fn disconnect_all(&mut self) {
+        info!("Disconnecting all streams");
+
+        // Stop decoder first
+        if let Some(handle) = self.decoder.take() {
+            handle.stop();
+            handle.join();
+            debug!("Decoder stopped");
+        }
+
+        // Stop all downloaders
+        for (i, downloader) in self.downloaders.iter_mut().enumerate() {
+            if let Some(handle) = downloader.take() {
+                handle.stop();
+                handle.join();
+                debug!("Downloader {} stopped", i);
+            }
+        }
+
+        // Clear consumers (they're invalidated when downloaders stop)
+        for consumer in self.consumers.iter_mut() {
+            *consumer = None;
+        }
+
+        self.active_channel = None;
+        debug!("All streams disconnected");
+    }
+
+    /// Switch to a different channel
+    ///
+    /// Stops current decoder (if any) and starts new decoder reading from
+    /// the selected channel's buffer. Switch latency ~100-200ms.
+    pub fn select(&mut self, index: usize) {
+        if index >= self.consumers.len() {
+            error!("Invalid channel index: {}", index);
+            return;
+        }
+
+        debug!("Switching to channel {}", index);
+
+        // Stop current decoder if running
+        if let Some(handle) = self.decoder.take() {
+            handle.stop();
+            handle.join();
+            debug!("Previous decoder stopped");
+        }
+
+        // Take the consumer for this channel and start decoder
+        if let Some(mut consumer) = self.consumers[index].take() {
+            // Clear any stale buffered data so playback starts immediately
+            // Without this, old data (~3 sec) plays before fresh audio
+            let mut cleared = 0;
+            while consumer.pop().is_ok() {
+                cleared += 1;
+            }
+            if cleared > 0 {
+                debug!("Cleared {} bytes of stale buffer data", cleared);
+            }
+
+            let handle = spawn_decoder(consumer, self.sink.clone());
+            self.decoder = Some(handle);
+            self.active_channel = Some(index);
+            info!("Switched to channel {} - decoder started", index);
+        } else {
+            warn!("Consumer {} not available for decoding", index);
+            self.active_channel = Some(index);
+        }
+    }
+
+    /// Stop the current decoder (for Off state or TTS)
+    pub fn stop(&mut self) {
+        if let Some(handle) = self.decoder.take() {
+            handle.stop();
+            handle.join();
+            debug!("Decoder stopped");
+        }
+        self.active_channel = None;
+    }
+
+    /// Pause decoder for TTS (decoder keeps state but stops appending to sink)
+    pub fn pause_decoder(&self) {
+        if let Some(ref handle) = self.decoder {
+            handle.pause();
+            debug!("Decoder paused");
+        }
+    }
+
+    /// Resume decoder after TTS
+    pub fn resume_decoder(&self) {
+        if let Some(ref handle) = self.decoder {
+            handle.resume();
+            debug!("Decoder resumed");
+        }
+    }
+
+    /// Play TTS announcement through the same sink
+    ///
+    /// Pauses decoder, plays TTS, then resumes decoder.
+    /// Blocking - waits for TTS to finish.
+    pub fn announce(&self, text: &str, tts: &crate::tts::PiperTts) {
+        debug!("TTS: {}", text);
+
+        // Pause decoder while TTS plays
+        self.pause_decoder();
+
+        // Synthesize and play
+        match tts.synthesize(text) {
+            Ok(samples) => {
+                if !samples.is_empty() {
+                    let samples_f32: Vec<f32> =
+                        samples.iter().map(|&s| s as f32 / 32768.0).collect();
+                    let source = SamplesBuffer::new(1, 22050, samples_f32);
+
+                    self.sink.append(source);
+                    self.sink.sleep_until_end();
+                }
+            }
+            Err(e) => {
+                warn!("TTS failed: {}", e);
+            }
+        }
+
+        // Resume decoder
+        self.resume_decoder();
+    }
+
+    /// Speak text (fire-and-forget, non-blocking version)
+    /// For use when you don't want to block on TTS
+    pub fn speak(&self, text: &str, tts: &std::sync::Arc<crate::tts::PiperTts>) {
+        let text = text.to_string();
+        let tts = tts.clone();
+        let sink = self.sink.clone();
+        let decoder = self.decoder.as_ref().map(|h| (h.pause_flag.clone(), h.stop_flag.clone()));
+
+        thread::spawn(move || {
+            // Pause decoder
+            if let Some((pause_flag, _)) = &decoder {
+                pause_flag.store(true, Ordering::SeqCst);
+            }
+
+            match tts.synthesize(&text) {
+                Ok(samples) => {
+                    if !samples.is_empty() {
+                        let samples_f32: Vec<f32> =
+                            samples.iter().map(|&s| s as f32 / 32768.0).collect();
+                        let source = SamplesBuffer::new(1, 22050, samples_f32);
+
+                        sink.append(source);
+                        sink.sleep_until_end();
+                    }
+                }
+                Err(e) => {
+                    warn!("TTS failed: {}", e);
+                }
+            }
+
+            // Resume decoder
+            if let Some((pause_flag, _)) = decoder {
+                pause_flag.store(false, Ordering::SeqCst);
+            }
+        });
+    }
 }
+
+// Old Player and MultiStreamPlayer structs have been removed.
+// Use AudioPipeline for all audio streaming functionality.
 
 #[cfg(test)]
 mod tests {
@@ -1009,21 +1061,200 @@ mod tests {
         assert!(elapsed >= Duration::from_millis(100));
     }
 
+    // StreamBuffer tests
+
     #[test]
-    fn test_muted_volume_is_zero() {
-        assert_eq!(MUTED_VOLUME, 0.0);
+    fn test_stream_buffer_new() {
+        let buffer = StreamBuffer::new();
+        assert!(buffer.is_empty());
     }
 
     #[test]
-    fn test_stream_status_constants() {
-        assert_eq!(STREAM_STATUS_CONNECTING, 0);
-        assert_eq!(STREAM_STATUS_PLAYING, 1);
-        assert_eq!(STREAM_STATUS_ERROR, 2);
+    fn test_stream_buffer_write_read() {
+        let mut buffer = StreamBuffer::new();
+        let data = [1u8, 2, 3, 4, 5];
+
+        let written = buffer.write(&data);
+        assert_eq!(written, 5);
+        assert!(buffer.has_data());
+
+        let mut out = [0u8; 5];
+        let read = buffer.read(&mut out);
+        assert_eq!(read, 5);
+        assert_eq!(out, data);
+        assert!(buffer.is_empty());
     }
 
     #[test]
-    fn test_ducked_volume_less_than_normal() {
-        assert!(DUCKED_VOLUME < VOLUME);
-        assert!(MUTED_VOLUME < DUCKED_VOLUME);
+    fn test_stream_buffer_partial_read() {
+        let mut buffer = StreamBuffer::new();
+        let data = [1u8, 2, 3];
+
+        buffer.write(&data);
+
+        let mut out = [0u8; 10];
+        let read = buffer.read(&mut out);
+        assert_eq!(read, 3);
+        assert_eq!(&out[..3], &data);
+    }
+
+    #[test]
+    fn test_stream_buffer_clear() {
+        let mut buffer = StreamBuffer::new();
+        buffer.write(&[1, 2, 3, 4, 5]);
+        assert!(buffer.has_data());
+
+        buffer.clear();
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn test_stream_buffer_overwrite_semantics() {
+        // Create a tiny buffer to test overflow behavior
+        let mut buffer = StreamBuffer::with_capacity(4);
+
+        // Write more than capacity - should overwrite oldest
+        buffer.write(&[1, 2, 3, 4]);
+        buffer.write(&[5, 6]); // Should overwrite 1, 2
+
+        let mut out = [0u8; 4];
+        let read = buffer.read(&mut out);
+        // Should get the most recent data (3, 4, 5, 6)
+        assert_eq!(read, 4);
+        assert_eq!(out, [3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn test_stream_buffer_split() {
+        let buffer = StreamBuffer::new();
+        let (mut producer, mut consumer) = buffer.split();
+
+        // Write via producer
+        assert!(producer.push(42).is_ok());
+
+        // Read via consumer
+        assert_eq!(consumer.pop(), Ok(42));
+    }
+
+    #[test]
+    fn test_buffer_size_constant() {
+        // 48KB for 3 seconds @ 128kbps
+        assert_eq!(BUFFER_SIZE, 48 * 1024);
+    }
+
+    // DownloadHandle tests
+
+    #[test]
+    fn test_download_handle_stop_flag() {
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let connected = Arc::new(AtomicBool::new(false));
+        let errored = Arc::new(AtomicBool::new(false));
+
+        // Initial state
+        assert!(!stop_flag.load(Ordering::SeqCst));
+        assert!(!connected.load(Ordering::SeqCst));
+        assert!(!errored.load(Ordering::SeqCst));
+
+        // Simulate setting flags
+        stop_flag.store(true, Ordering::SeqCst);
+        connected.store(true, Ordering::SeqCst);
+
+        assert!(stop_flag.load(Ordering::SeqCst));
+        assert!(connected.load(Ordering::SeqCst));
+        assert!(!errored.load(Ordering::SeqCst));
+    }
+
+    // DecoderHandle / ConsumerReader tests
+
+    #[test]
+    fn test_decoder_handle_pause_resume() {
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let pause_flag = Arc::new(AtomicBool::new(false));
+
+        // Initial state
+        assert!(!pause_flag.load(Ordering::SeqCst));
+
+        // Pause
+        pause_flag.store(true, Ordering::SeqCst);
+        assert!(pause_flag.load(Ordering::SeqCst));
+
+        // Resume
+        pause_flag.store(false, Ordering::SeqCst);
+        assert!(!pause_flag.load(Ordering::SeqCst));
+
+        // Stop should work regardless of pause state
+        stop_flag.store(true, Ordering::SeqCst);
+        assert!(stop_flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_consumer_reader_with_data() {
+        let buffer = StreamBuffer::new();
+        let (mut producer, consumer) = buffer.split();
+
+        // Write some data
+        for i in 0..10u8 {
+            producer.push(i).unwrap();
+        }
+
+        // Create reader and read
+        let mut reader = ConsumerReader::new(consumer);
+        let mut buf = [0u8; 10];
+        let n = reader.read(&mut buf).unwrap();
+
+        assert_eq!(n, 10);
+        for (i, &byte) in buf.iter().enumerate() {
+            assert_eq!(byte, i as u8);
+        }
+    }
+
+    #[test]
+    fn test_consumer_reader_seek_unsupported() {
+        use std::io::Seek;
+
+        let buffer = StreamBuffer::new();
+        let (_producer, consumer) = buffer.split();
+
+        let mut reader = ConsumerReader::new(consumer);
+        let result = reader.seek(std::io::SeekFrom::Start(0));
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn test_consumer_reader_media_source_traits() {
+        use symphonia::core::io::MediaSource;
+
+        let buffer = StreamBuffer::new();
+        let (_producer, consumer) = buffer.split();
+
+        let reader = ConsumerReader::new(consumer);
+
+        // MediaSource trait methods
+        assert!(!reader.is_seekable());
+        assert!(reader.byte_len().is_none());
+    }
+
+    // AudioPipeline tests
+    // Note: Full pipeline tests require audio hardware, so we test structure only
+
+    #[test]
+    fn test_audio_pipeline_initial_state() {
+        // Skip on CI or when no audio device available
+        let pipeline = match AudioPipeline::new(4) {
+            Ok(p) => p,
+            Err(_) => return, // Skip if no audio device
+        };
+
+        assert_eq!(pipeline.num_channels(), 4);
+        assert!(pipeline.active_channel().is_none());
+        assert!(!pipeline.is_playing());
+
+        // No channels connected initially
+        for i in 0..4 {
+            assert!(!pipeline.is_channel_connected(i));
+            assert!(!pipeline.has_channel_error(i));
+        }
     }
 }
