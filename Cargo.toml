@@ -1,6 +1,6 @@
 [package]
 name = "lego-radio"
-version = "0.3.4"
+version = "0.4.0"
 edition = "2021"
 description = "A LEGO-based internet radio with single button control"
 license = "MIT"
@@ -32,6 +32,7 @@ anyhow = "1"
 
 # Terminal input (for testing without GPIO)
 crossterm = "0.28"
+m3u8-rs = "6.0.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # GPIO for Raspberry Pi (only on Linux)

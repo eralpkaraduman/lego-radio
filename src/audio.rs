@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use log::{debug, error, info, warn};
 use rodio::buffer::SamplesBuffer;
 use rodio::{OutputStream, Sink};
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -237,29 +237,45 @@ fn stream_loop(
 ) {
     debug!("Starting stream from: {}", url);
 
-    // Make HTTP request
-    let response = match ureq::get(url)
-        .set("User-Agent", "lego-radio/1.0")
-        .set("Icy-MetaData", "0")
-        .call()
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            error!("HTTP connection failed: {}", e);
-            let _ = connected_tx.send(false);
-            return;
-        }
+    // Check if HLS stream
+    let is_hls = url.contains(".m3u8");
+
+    let mss = if is_hls {
+        // HLS stream - use segment reader
+        debug!("Detected HLS stream");
+        let hls_reader = match HlsReader::new(url, stop_flag.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("HLS connection failed: {}", e);
+                let _ = connected_tx.send(false);
+                return;
+            }
+        };
+        let _ = connected_tx.send(true);
+        let reader = StoppableReader::new(hls_reader, stop_flag.clone());
+        MediaSourceStream::new(Box::new(reader), Default::default())
+    } else {
+        // Regular stream - direct HTTP
+        let response = match ureq::get(url)
+            .set("User-Agent", "lego-radio/1.0")
+            .set("Icy-MetaData", "0")
+            .call()
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                error!("HTTP connection failed: {}", e);
+                let _ = connected_tx.send(false);
+                return;
+            }
+        };
+
+        let content_type = response.content_type().to_string();
+        debug!("Connected, Content-Type: {}", content_type);
+        let _ = connected_tx.send(true);
+
+        let reader = StoppableReader::new(response.into_reader(), stop_flag.clone());
+        MediaSourceStream::new(Box::new(reader), Default::default())
     };
-
-    let content_type = response.content_type().to_string();
-    debug!("Connected, Content-Type: {}", content_type);
-
-    // Signal connected
-    let _ = connected_tx.send(true);
-
-    // Create a reader that checks stop flag
-    let reader = StoppableReader::new(response.into_reader(), stop_flag.clone());
-    let mss = MediaSourceStream::new(Box::new(reader), Default::default());
 
     // Probe the format
     let format_opts = FormatOptions {
@@ -372,6 +388,178 @@ fn stream_loop(
     }
 
     debug!("Stream loop ended");
+}
+
+// =============================================================================
+// HlsReader - Reads HLS streams by fetching segments sequentially
+// =============================================================================
+
+/// Reader that fetches HLS segments and presents them as a continuous stream
+struct HlsReader {
+    /// Base URL for segments (playlist URL without filename)
+    base_url: String,
+    /// Full playlist URL (for refreshing)
+    playlist_url: String,
+    /// Current segment data being read
+    current_segment: Cursor<Vec<u8>>,
+    /// Queue of segment URLs to fetch
+    segment_queue: Vec<String>,
+    /// Index of next segment in queue
+    next_segment_idx: usize,
+    /// Last media sequence number seen (for live stream updates)
+    last_media_sequence: u64,
+    /// Stop flag to check
+    stop_flag: Arc<AtomicBool>,
+}
+
+impl HlsReader {
+    fn new(url: &str, stop_flag: Arc<AtomicBool>) -> Result<Self, std::io::Error> {
+        // Extract base URL (everything up to last /)
+        let base_url = url.rsplit_once('/')
+            .map(|(base, _)| format!("{}/", base))
+            .unwrap_or_else(|| url.to_string());
+
+        let mut reader = Self {
+            base_url,
+            playlist_url: url.to_string(),
+            current_segment: Cursor::new(Vec::new()),
+            segment_queue: Vec::new(),
+            next_segment_idx: 0,
+            last_media_sequence: 0,
+            stop_flag,
+        };
+
+        // Fetch initial playlist
+        reader.refresh_playlist()?;
+
+        // Pre-fetch first segment
+        reader.fetch_next_segment()?;
+
+        Ok(reader)
+    }
+
+    /// Refresh playlist and add new segments to queue
+    fn refresh_playlist(&mut self) -> Result<(), std::io::Error> {
+        debug!("Fetching HLS playlist: {}", self.playlist_url);
+
+        let response = ureq::get(&self.playlist_url)
+            .set("User-Agent", "lego-radio/1.0")
+            .call()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+        let mut body = String::new();
+        response.into_reader().read_to_string(&mut body)?;
+
+        // Parse playlist using m3u8-rs
+        let parsed = m3u8_rs::parse_playlist_res(body.as_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{:?}", e)))?;
+
+        match parsed {
+            m3u8_rs::Playlist::MediaPlaylist(playlist) => {
+                let media_sequence = playlist.media_sequence;
+
+                // Only add segments we haven't seen
+                if media_sequence > self.last_media_sequence || self.segment_queue.is_empty() {
+                    self.segment_queue.clear();
+                    self.next_segment_idx = 0;
+
+                    for segment in &playlist.segments {
+                        let segment_url = if segment.uri.starts_with("http") {
+                            segment.uri.clone()
+                        } else {
+                            format!("{}{}", self.base_url, segment.uri)
+                        };
+                        self.segment_queue.push(segment_url);
+                    }
+
+                    self.last_media_sequence = media_sequence;
+                    debug!("HLS: loaded {} segments", self.segment_queue.len());
+                }
+            }
+            m3u8_rs::Playlist::MasterPlaylist(master) => {
+                // Master playlist - pick first variant
+                if let Some(variant) = master.variants.first() {
+                    let variant_url = if variant.uri.starts_with("http") {
+                        variant.uri.clone()
+                    } else {
+                        format!("{}{}", self.base_url, variant.uri)
+                    };
+                    debug!("HLS: following master playlist to {}", variant_url);
+                    self.playlist_url = variant_url.clone();
+                    self.base_url = variant_url.rsplit_once('/')
+                        .map(|(base, _)| format!("{}/", base))
+                        .unwrap_or(self.base_url.clone());
+                    return self.refresh_playlist();
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Empty master playlist",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Fetch the next segment into current_segment buffer
+    fn fetch_next_segment(&mut self) -> Result<(), std::io::Error> {
+        // Check if we need to refresh playlist (live stream)
+        if self.next_segment_idx >= self.segment_queue.len() {
+            // Give the server a moment before refreshing
+            std::thread::sleep(Duration::from_millis(500));
+            self.refresh_playlist()?;
+
+            // If still no segments, we're done
+            if self.next_segment_idx >= self.segment_queue.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "No more segments",
+                ));
+            }
+        }
+
+        let segment_url = &self.segment_queue[self.next_segment_idx];
+        debug!("HLS: fetching segment {}", self.next_segment_idx);
+
+        let response = ureq::get(segment_url)
+            .set("User-Agent", "lego-radio/1.0")
+            .call()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+        let mut data = Vec::new();
+        response.into_reader().read_to_end(&mut data)?;
+
+        self.current_segment = Cursor::new(data);
+        self.next_segment_idx += 1;
+
+        Ok(())
+    }
+}
+
+impl Read for HlsReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // Check stop flag
+        if self.stop_flag.load(Ordering::SeqCst) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "Stopped",
+            ));
+        }
+
+        // Try to read from current segment
+        let n = self.current_segment.read(buf)?;
+
+        if n > 0 {
+            return Ok(n);
+        }
+
+        // Current segment exhausted, fetch next one
+        match self.fetch_next_segment() {
+            Ok(()) => self.current_segment.read(buf),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 // =============================================================================

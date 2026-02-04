@@ -55,6 +55,27 @@ pub const CHANNELS: &[Channel] = &[
         tts_name: "B B C World Service",
         url: "http://stream.live.vc.bbcmedia.co.uk/bbc_world_service",
     },
+    // BBC Radio (HLS streams)
+    Channel {
+        name: "BBC Radio 1",
+        tts_name: "B B C Radio 1",
+        url: "http://as-hls-ww-live.akamaized.net/pool_01505109/live/ww/bbc_radio_one/bbc_radio_one.isml/bbc_radio_one-audio=96000.norewind.m3u8",
+    },
+    Channel {
+        name: "BBC Radio 2",
+        tts_name: "B B C Radio 2",
+        url: "http://as-hls-ww-live.akamaized.net/pool_74208725/live/ww/bbc_radio_two/bbc_radio_two.isml/bbc_radio_two-audio=96000.norewind.m3u8",
+    },
+    Channel {
+        name: "BBC Radio 3",
+        tts_name: "B B C Radio 3",
+        url: "http://as-hls-ww-live.akamaized.net/pool_23461179/live/ww/bbc_radio_three/bbc_radio_three.isml/bbc_radio_three-audio=96000.norewind.m3u8",
+    },
+    Channel {
+        name: "BBC Radio 4",
+        tts_name: "B B C Radio 4",
+        url: "http://as-hls-ww-live.akamaized.net/pool_55057080/live/ww/bbc_radio_fourfm/bbc_radio_fourfm.isml/bbc_radio_fourfm-audio=128000.norewind.m3u8",
+    },
 ];
 
 #[cfg(test)]
