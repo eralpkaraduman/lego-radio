@@ -185,20 +185,46 @@ pub struct AudioPipeline {
 
 ### Ring Buffer
 
-Each channel has a ring buffer storing ~3 seconds of compressed audio:
+Each channel has a ring buffer storing ~3 seconds of compressed audio.
+
+**Use existing crate:** [rtrb](https://github.com/mgeier/rtrb) (real-time ring buffer)
+- Wait-free SPSC (single-producer single-consumer)
+- Based on crossbeam code (battle-tested)
+- Designed for real-time audio
+- no_std compatible
 
 ```rust
-struct RingBuffer {
-    data: [u8; BUFFER_SIZE],      // ~48KB for 3s @ 128kbps
-    write_pos: AtomicUsize,       // Where downloader writes
-    read_pos: AtomicUsize,        // Where decoder reads
+use rtrb::{RingBuffer, Producer, Consumer};
+
+// 48KB = 3 seconds @ 128kbps
+const BUFFER_SIZE: usize = 48 * 1024;
+
+struct StreamBuffer {
+    producer: Producer<u8>,   // Download thread writes here
+    consumer: Consumer<u8>,   // Decoder thread reads here
 }
+
+// Create buffer (returns producer/consumer pair)
+let (producer, consumer) = RingBuffer::new(BUFFER_SIZE);
 ```
 
-**Properties:**
-- Lock-free (atomic positions)
-- Overwrites old data when full (live stream, no rewinding)
-- Decoder finds sync point (MP3 frame / AAC sync word) on start
+**Buffer size calculation:**
+- 128 kbps = 128,000 bits/sec = 16,000 bytes/sec
+- 3 seconds = 48,000 bytes ≈ 48 KB
+
+**Semantics:**
+| Condition | Behavior |
+|-----------|----------|
+| Buffer full (writer catches reader) | Writer blocks or drops oldest data |
+| Buffer empty (reader catches writer) | Reader blocks or returns None |
+| Overflow strategy | Use `push_overwrite()` - live stream, old data is stale |
+| Underflow strategy | Return silence, signal "buffering" state |
+
+**Sync point finding:**
+When decoder starts reading from a new buffer, it must find a valid frame boundary:
+- MP3: Look for sync word `0xFF 0xFB` (or `0xFF 0xFA`, `0xFF 0xF3`, etc.)
+- AAC: Look for ADTS sync word `0xFFF`
+- Symphonia handles this automatically via `probe()`
 
 ### Download Threads
 
