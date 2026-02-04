@@ -30,9 +30,6 @@ env_logger = "0.11"
 # Error handling
 anyhow = "1"
 
-# Lock-free ring buffer for real-time audio streaming
-rtrb = "0.3"
-
 # Terminal input (for testing without GPIO)
 crossterm = "0.28"
 

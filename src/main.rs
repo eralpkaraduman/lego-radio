@@ -6,6 +6,7 @@ mod updater;
 
 use anyhow::Result;
 use log::{error, info};
+use std::sync::mpsc::Receiver;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -97,13 +98,12 @@ Channels cycle: Welcome → 1 → 2 → 3 → 4 → OFF → Welcome
 fn run_radio() -> Result<()> {
     info!("lego-radio v{} starting", VERSION);
 
-    // Initialize TTS (downloads piper and voice model if needed, checks capability once)
+    // Initialize TTS (downloads piper and voice model if needed)
     info!("Initializing TTS...");
     let tts = tts::PiperTts::new()?;
 
-    // Single-pipe audio pipeline (downloads all channels, decodes one at a time)
-    let num_channels = channels::CHANNELS.len();
-    let mut pipeline = audio::AudioPipeline::new(num_channels)?;
+    // Simple audio pipeline (connect on demand)
+    let mut pipeline = audio::AudioPipeline::new()?;
 
     // Channel for button events (input thread -> main thread)
     let (tx, rx) = std::sync::mpsc::channel::<()>();
@@ -122,76 +122,116 @@ fn run_radio() -> Result<()> {
 
     // State machine starts at Welcome
     let mut state = RadioState::Welcome;
+    let num_channels = channels::CHANNELS.len();
 
-    // Handle Welcome state on startup (connects all streams)
+    // Handle Welcome state on startup
     handle_welcome(&mut pipeline, &tts);
 
+    // Drain any button presses that happened during welcome
+    while rx.try_recv().is_ok() {}
+
+    let mut skip_wait = false;  // Skip waiting for button press (after interrupt)
+
     loop {
-        // Wait for button press
-        rx.recv().ok();
+        if !skip_wait {
+            // Wait for button press
+            rx.recv().ok();
 
-        // Consume any extra presses that happened during processing
-        let mut discarded = 0;
-        while rx.try_recv().is_ok() {
-            discarded += 1;
-        }
-        if discarded > 0 {
-            log::debug!("Discarded {} extra button press(es)", discarded);
-        }
+            // Drain any extra queued button presses (rapid pressing)
+            while rx.try_recv().is_ok() {}
 
-        // Transition to next state
-        state = state.next(num_channels);
+            // Stop everything and clear buffer immediately
+            pipeline.stop();
+
+            // Immediate audio feedback
+            pipeline.beep();
+
+            // Transition to next state
+            state = state.next(num_channels);
+        }
+        skip_wait = false;  // Reset flag
+
         info!("State: {:?}", state);
 
         match state {
             RadioState::Welcome => {
                 handle_welcome(&mut pipeline, &tts);
+                // Drain any presses during welcome
+                while rx.try_recv().is_ok() {}
             }
             RadioState::Playing(idx) => {
-                let channel = &channels::CHANNELS[idx];
-                info!("Channel {}: {}", idx + 1, channel.name);
-
-                // Announce channel name (pauses decoder, plays TTS, resumes decoder)
-                pipeline.announce(channel.tts_name, &tts);
-
-                // Switch to new channel (stops old decoder, starts new one)
-                pipeline.select(idx);
-
-                // Error recovery is handled automatically by download threads
-                // They retry with exponential backoff and mark stream as errored after 3 failures
-                if pipeline.has_channel_error(idx) {
-                    pipeline.announce("Station unavailable. Try another channel.", &tts);
+                // Play channel with interrupt support
+                if !play_channel(&mut pipeline, &tts, idx, &rx) {
+                    // Interrupted - advance to next state and process immediately
+                    state = state.next(num_channels);
+                    pipeline.stop();
+                    pipeline.beep();
+                    skip_wait = true;  // Don't wait, process new state now
+                    continue;
                 }
             }
             RadioState::Off => {
                 info!("Radio OFF");
                 pipeline.announce("Radio off", &tts);
-                pipeline.disconnect_all();  // Stop decoder, downloaders, save bandwidth
             }
         }
     }
 }
 
-/// Handle the Welcome state - greet, check for updates, connect all streams
+/// Play a channel with interrupt support
+/// Returns false if interrupted (caller should continue loop)
+fn play_channel(
+    pipeline: &mut audio::AudioPipeline,
+    tts: &tts::PiperTts,
+    idx: usize,
+    rx: &Receiver<()>,
+) -> bool {
+    let channel = &channels::CHANNELS[idx];
+    info!("Channel {}: {}", idx + 1, channel.name);
+
+    // Announce channel name (interruptible)
+    if !pipeline.announce_interruptible(channel.tts_name, tts, Some(rx)) {
+        info!("Interrupted during channel name");
+        return false;
+    }
+
+    // Announce connecting (interruptible)
+    if !pipeline.announce_interruptible("Connecting", tts, Some(rx)) {
+        info!("Interrupted during connecting");
+        return false;
+    }
+
+    // Connect and play
+    if pipeline.connect_and_play(channel.url) {
+        // Successfully connected - stream is now playing
+        true
+    } else {
+        // Connection failed
+        pipeline.announce("Station unavailable. Try another channel.", tts);
+        true
+    }
+}
+
+/// Handle the Welcome state - greet, check for updates
 fn handle_welcome(pipeline: &mut audio::AudioPipeline, tts: &tts::PiperTts) {
     info!("Welcome - checking for updates");
     pipeline.announce("Hello!", tts);
-    pipeline.announce("Checking for updates. Please wait.", tts);
+    pipeline.announce("Checking for updates.", tts);
 
     match updater::check_for_update() {
         Some(version) => {
             info!("Update available: v{}", version);
-            pipeline.announce("Update found. Installing. This may take a minute.", tts);
+            pipeline.announce("Update found. Installing.", tts);
 
             match updater::do_update() {
                 Ok(()) => {
-                    pipeline.announce("Update complete. Restarting now.", tts);
+                    pipeline.announce("Update complete. Restarting.", tts);
                     std::thread::sleep(std::time::Duration::from_secs(2));
                     std::process::exit(0);
                 }
                 Err(e) => {
                     error!("Update failed: {}", e);
-                    pipeline.announce("Update failed. Continuing anyway.", tts);
+                    pipeline.announce("Update failed.", tts);
                 }
             }
         }
@@ -201,29 +241,14 @@ fn handle_welcome(pipeline: &mut audio::AudioPipeline, tts: &tts::PiperTts) {
         }
     }
 
-    // Connect all streams (starts download threads filling ring buffers)
-    pipeline.announce("Connecting to stations. Please wait.", tts);
-    let connected = pipeline.connect_all(
-        channels::CHANNELS,
-        std::time::Duration::from_secs(10),
-    );
-
-    // Announce connection status
-    let msg = format!(
-        "Connected {} out of {} stations.",
-        connected,
-        channels::CHANNELS.len()
-    );
-    pipeline.announce(&msg, tts);
-
-    pipeline.announce("Change channel to start playing.", tts);
+    pipeline.announce("Press button to select channel.", tts);
 }
 
 fn test_tts() -> Result<()> {
     println!("Testing TTS (downloading piper if needed)...");
 
     let tts = tts::PiperTts::new()?;
-    let pipeline = audio::AudioPipeline::new(1)?;
+    let mut pipeline = audio::AudioPipeline::new()?;
 
     for channel in channels::CHANNELS.iter() {
         println!("  Speaking: {}", channel.tts_name);
@@ -240,27 +265,18 @@ fn test_stream(url: &str) -> Result<()> {
     println!("Testing stream: {}", url);
     println!("Press Ctrl+C to stop");
 
-    // Create a single-channel pipeline for testing
-    let mut pipeline = audio::AudioPipeline::new(1)?;
+    let mut pipeline = audio::AudioPipeline::new()?;
 
-    // Leak the URL to make it 'static (acceptable for test utilities)
-    let url_static: &'static str = Box::leak(url.to_string().into_boxed_str());
-
-    // Create a temporary channel with the test URL
-    let test_channel = channels::Channel {
-        name: "Test",
-        tts_name: "Test stream",
-        url: url_static,
-    };
-
-    // Connect and start playing
-    pipeline.connect_all(&[test_channel], std::time::Duration::from_secs(10));
-    pipeline.select(0);
-
-    // Wait forever (until Ctrl+C)
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
+    if pipeline.connect_and_play(url) {
+        // Wait forever (until Ctrl+C)
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    } else {
+        println!("Failed to connect to stream");
     }
+
+    Ok(())
 }
 
 fn install_service() -> Result<()> {
