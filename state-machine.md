@@ -438,32 +438,62 @@ flowchart TB
 
 ## TTS Subsystem
 
+**Cross-Platform Design:** TTS uses the same Piper voice on all platforms. On Raspberry Pi, Piper runs natively. On macOS (development), Piper runs in a Docker container (linux/amd64 via Rosetta). This ensures the same audio output during development and production.
+
 ```mermaid
 flowchart TB
     START[Boot] --> CHECK[Check System Piper]
-    CHECK -->|Found| TEST[Test Piper]
+    CHECK -->|Found| TEST[Test Native Piper]
     CHECK -->|Not found| DL[Download Piper]
     DL --> TEST
-    TEST -->|Works| PIPER[Use Piper]
-    TEST -->|Fails macOS| SAY[Use macOS say]
-    TEST -->|Fails other| NONE[No TTS]
+
+    TEST -->|Works| PIPER[Use Native Piper]
+    TEST -->|Fails| PLATFORM{Platform?}
+
+    PLATFORM -->|macOS| DOCKER[Test Docker Piper]
+    PLATFORM -->|Other| NONE[No TTS]
+
+    DOCKER -->|Works| DPIPER[Use Docker Piper]
+    DOCKER -->|Fails| SAY[Test macOS say]
+
+    SAY -->|Works| MACSAY[Use macOS say]
+    SAY -->|Fails| NONE
+
     PIPER --> READY[Ready]
-    SAY --> READY
+    DPIPER --> READY
+    MACSAY --> READY
     NONE --> READY
 ```
 
 **TTS Engine Selection (checked once at boot):**
 1. Try system-installed Piper (`/opt/piper` or `/usr/local/piper`)
 2. Download Piper to `~/.local/share/lego-radio/`
-3. Test Piper with "test" synthesis
-4. Fall back to macOS `say` command if Piper fails (macOS only)
-5. Store result in `engine` field (no runtime checks)
+3. Test native Piper with "test" synthesis
+4. If native fails on macOS: try Docker Piper (`lego-radio-piper` image)
+5. If Docker fails on macOS: fall back to `say` command (different voice)
+6. Store result in `engine` field (no runtime checks)
 
-**Platform Differences:**
-| Engine | Audio Output | Synthesis Time |
-|--------|--------------|----------------|
-| Piper | Same sink as stream | 1-2s on Pi |
-| macOS `say` | macOS speech system | Immediate |
+**Platform Configuration:**
+| Platform | Primary Engine | Fallback | Voice |
+|----------|----------------|----------|-------|
+| Raspberry Pi | Native Piper | None | en_US-lessac-medium |
+| macOS (dev) | Docker Piper | macOS say | en_US-lessac-medium (Docker) |
+| Linux x86 | Native Piper | None | en_US-lessac-medium |
+
+**Docker Piper Setup (macOS only):**
+```bash
+# Build once (uses linux/amd64 via Rosetta)
+docker build -f Dockerfile.piper -t lego-radio-piper .
+
+# Voice model downloaded automatically to ~/.local/share/lego-radio/
+```
+
+**Engine Behavior:**
+| Engine | Audio Output | Synthesis Time | Notes |
+|--------|--------------|----------------|-------|
+| Native Piper | Same sink as stream | 1-2s on Pi | Direct binary |
+| Docker Piper | Same sink as stream | 2-3s on Mac | Container overhead |
+| macOS `say` | System audio (bypass) | Immediate | Different voice, last resort |
 
 ## Concurrency Model
 
