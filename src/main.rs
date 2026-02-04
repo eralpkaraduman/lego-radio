@@ -86,10 +86,10 @@ OPTIONS:
     --test-stream     Test audio streaming [URL]
 
 CONTROLS:
-    On Raspberry Pi: Press the GPIO button to cycle channels
-    On Mac/Desktop:  Press Enter to cycle channels
+    On Raspberry Pi: Channel switch (GPIO) cycles stations
+    On Mac/Desktop:  Press Enter to cycle stations
 
-Channels cycle: Welcome → 1 → 2 → 3 → 4 → OFF → Welcome
+Channels cycle: Welcome → 1 → 2 → ... → N → OFF → Welcome
 "#,
         VERSION
     );
@@ -296,7 +296,7 @@ fn handle_welcome(pipeline: &mut audio::AudioPipeline, tts: &tts::PiperTts) {
         }
     }
 
-    pipeline.announce("Press button to select channel.", tts);
+    pipeline.announce("Ready.", tts);
 }
 
 fn test_tts() -> Result<()> {

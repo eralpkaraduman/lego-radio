@@ -1,12 +1,13 @@
 # LEGO Radio
 
-A LEGO-based internet radio with single button control, powered by Raspberry Pi.
+A LEGO-based internet radio with channel switch control, powered by Raspberry Pi.
 
 ## Features
 
-- Single button cycles through radio channels
+- Channel switch cycles through radio stations
 - Text-to-speech announces each channel (interruptible)
-- Instant beep feedback on button press
+- Instant beep feedback on input
+- Auto-reconnect on connection loss
 - Self-updating binary
 - Runs as a systemd service
 
@@ -16,24 +17,25 @@ Simple state machine: `Welcome → Channel 1 → ... → Channel N → Off → (
 
 **Connect-on-demand design:**
 - One stream at a time (no pre-buffering)
-- Button press → immediate beep → stop current stream → announce next channel → connect
-- TTS is interruptible - press button to skip to next state
-- Minimal resource usage in Off state (just input thread waiting)
+- Input → immediate beep → stop current stream → announce next channel → connect
+- TTS is interruptible - switch again to skip to next state
+- Auto-reconnects if stream drops (30s retry interval)
+- Minimal resource usage in Off state
 
 ## Hardware
 
 - Raspberry Pi 4 (or 3B+)
 - [Audio Amp SHIM](https://shop.pimoroni.com/products/audio-amp-shim-3w-mono-amp) (3W mono I2S amp)
-- Momentary push button
+- Momentary switch (LEGO channel dial actuates this)
 - 4-8Ω speaker (3W or less)
 
 ### Wiring
 
 ```
-Button wiring (uses internal pull-up resistor):
+Switch wiring (uses internal pull-up resistor):
 
     GPIO 17 (pin 11) ──────┤ ├────── GND (pin 9)
-                          Button
+                          Switch
 
 Pin layout:
     ┌─────────────────────────────┐
@@ -64,12 +66,12 @@ The installer configures I2S audio, installs dependencies, and sets up the servi
 On power-on, the radio automatically:
 1. Says "Hello! Checking for updates..."
 2. Auto-updates if available
-3. Starts playing channel 1
+3. Says "Ready" and waits
 
-Then press the button to:
-- Cycle through channels
-- After last channel → radio off
-- Press again → restarts from welcome sequence
+Switch to:
+- Cycle through channels (1 → 2 → ... → N → Off → Welcome)
+- Skip TTS announcements
+- Interrupt reconnection attempts
 
 ## Commands
 
