@@ -30,6 +30,16 @@ pub const CHANNELS: &[Channel] = &[
         tts_name: "Soma Drone Zone",
         url: "https://ice1.somafm.com/dronezone-128-mp3",
     },
+    Channel {
+        name: "Radyo Eksen",
+        tts_name: "Radyo Eksen",
+        url: "http://eksenwmp.radyotvonline.com/;stream.mp3",
+    },
+    Channel {
+        name: "BBC World Service",
+        tts_name: "B B C World Service",
+        url: "http://stream.live.vc.bbcmedia.co.uk/bbc_world_service",
+    },
 ];
 
 #[cfg(test)]
