@@ -36,9 +36,14 @@ pub const CHANNELS: &[Channel] = &[
         url: "https://ice1.somafm.com/groovesalad-128-mp3",
     },
     Channel {
-        name: "Soma FM Drone Zone",
-        tts_name: "Soma Drone Zone",
-        url: "https://ice1.somafm.com/dronezone-128-mp3",
+        name: "Soma FM Indie Pop",
+        tts_name: "Soma Indie Pop Rocks",
+        url: "https://ice1.somafm.com/indiepop-128-mp3",
+    },
+    Channel {
+        name: "Soma FM Secret Agent",
+        tts_name: "Soma Secret Agent",
+        url: "https://ice1.somafm.com/secretagent-128-mp3",
     },
     Channel {
         name: "Radyo Eksen",
