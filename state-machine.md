@@ -349,7 +349,60 @@ pub fn disconnect_all(&mut self) {
 }
 ```
 
-## Button Input (Trailing Edge Debounce)
+## Button Input
+
+### Input Abstraction Layer
+
+Both GPIO (Raspberry Pi) and keyboard (Mac/desktop) use the **same debounce state machine**:
+
+```mermaid
+flowchart TB
+    subgraph Sources[Input Sources]
+        subgraph GPIO[GPIO - Raspberry Pi]
+            RPPAL[rppal crate] --> PIN[Pin 17 pull-up]
+        end
+
+        subgraph Keyboard[Keyboard - Mac/Desktop]
+            CROSS[crossterm crate] --> KEYS[Enter or Space]
+        end
+    end
+
+    subgraph Abstraction[ButtonInput Trait]
+        PIN --> PINREAD[PinReader trait]
+        KEYS --> PINREAD
+        PINREAD --> GENERIC[GenericGpioButton]
+    end
+
+    GENERIC --> DEBOUNCE[Trailing Edge Debounce]
+    DEBOUNCE --> MPSC[mpsc channel]
+    MPSC --> MAIN[Main Thread]
+```
+
+**Platform detection at runtime:**
+```rust
+pub fn create_button() -> Box<dyn ButtonInput> {
+    #[cfg(target_os = "linux")]
+    {
+        // Try GPIO first (fails on non-Pi Linux)
+        if let Ok(button) = GpioButton::new(17) {
+            return Box::new(button);
+        }
+    }
+    // Fall back to keyboard
+    Box::new(KeyboardButton::new())
+}
+```
+
+**Input configuration:**
+| Setting | Value | Notes |
+|---------|-------|-------|
+| GPIO Pin | 17 | With internal pull-up resistor |
+| Keyboard keys | Enter, Space | Either triggers press |
+| Exit key | Ctrl+C | Terminates program |
+| Poll interval | 10ms | How often pin/key is checked |
+| Debounce time | 150ms | Idle time required to register |
+
+### Trailing Edge Debounce
 
 ```mermaid
 flowchart TB
@@ -375,7 +428,13 @@ flowchart TB
 - Action registers only after user **stops pressing** for 150ms
 - Rapid presses reset the timer (trailing edge)
 - Prevents double-registration from mechanical bounce
+- **Identical behavior** for GPIO and keyboard inputs
 - Constant: `INPUT_DEBOUNCE_MS = 150`
+
+**Why trailing edge?**
+- Leading edge would fire immediately on first bounce
+- Trailing edge waits for stable "released" state
+- User intent is clearer after they stop pressing
 
 ## TTS Subsystem
 
