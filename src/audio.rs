@@ -3,7 +3,7 @@ use log::{debug, error, info, warn};
 use rodio::buffer::SamplesBuffer;
 use rodio::{OutputStream, OutputStreamHandle, Sink};
 use std::io::{BufReader, Read};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
@@ -225,6 +225,9 @@ struct StreamHandle {
     status: Arc<AtomicU8>,
 }
 
+/// Sentinel value for "no active stream"
+const NO_ACTIVE_STREAM: usize = usize::MAX;
+
 /// Multi-stream player - all channels playing simultaneously, one audible
 ///
 /// Architecture:
@@ -237,8 +240,9 @@ pub struct MultiStreamPlayer {
     stream_handle: OutputStreamHandle,
     /// Array of stream handles, one per channel
     streams: [Option<StreamHandle>; 4],
-    /// Currently active (audible) stream index, None = all muted
-    active_index: Option<usize>,
+    /// Currently active (audible) stream index, NO_ACTIVE_STREAM = all muted
+    /// Atomic for thread-safe access from TTS thread
+    active_index: Arc<AtomicUsize>,
 }
 
 impl MultiStreamPlayer {
@@ -251,7 +255,7 @@ impl MultiStreamPlayer {
             _stream: stream,
             stream_handle,
             streams: [None, None, None, None],
-            active_index: None,
+            active_index: Arc::new(AtomicUsize::new(NO_ACTIVE_STREAM)),
         })
     }
 
@@ -270,17 +274,37 @@ impl MultiStreamPlayer {
                 }
             }
         }
-        self.active_index = Some(index);
+        self.active_index.store(index, Ordering::SeqCst);
     }
 
-    /// Mute the active stream (for TTS or Off state)
-    pub fn mute_active(&self) {
-        if let Some(idx) = self.active_index {
-            if let Some(ref sh) = self.streams[idx] {
+    /// Mute all streams (for TTS or Off state)
+    pub fn mute_all(&self) {
+        for (i, stream) in self.streams.iter().enumerate() {
+            if let Some(ref sh) = stream {
                 if let Ok(sink_guard) = sh.sink.lock() {
                     if let Some(ref sink) = *sink_guard {
                         sink.set_volume(MUTED_VOLUME);
-                        debug!("Muted active stream {}", idx);
+                    }
+                }
+            }
+            debug!("Muted stream {}", i);
+        }
+    }
+
+    /// Unmute: mute all streams, then unmute only the current active stream
+    /// This ensures a clean state - only one stream audible
+    fn unmute_active(&self) {
+        // First mute all
+        self.mute_all();
+
+        // Then unmute only the current active stream
+        let idx = self.active_index.load(Ordering::SeqCst);
+        if idx != NO_ACTIVE_STREAM {
+            if let Some(ref sh) = self.streams.get(idx).and_then(|s| s.as_ref()) {
+                if let Ok(sink_guard) = sh.sink.lock() {
+                    if let Some(ref sink) = *sink_guard {
+                        sink.set_volume(VOLUME);
+                        debug!("Unmuted active stream {}", idx);
                     }
                 }
             }
@@ -313,17 +337,21 @@ impl MultiStreamPlayer {
     }
 
     /// Speak text using TTS (fire-and-forget, non-blocking)
-    /// Mutes active stream during TTS, unmutes after
+    /// Mutes all streams during TTS, unmutes active stream after
     pub fn speak(&self, text: &str, tts: &std::sync::Arc<crate::tts::PiperTts>) {
         debug!("TTS: {}", text);
 
-        // Mute active stream immediately
-        self.mute_active();
+        // Mute all streams immediately
+        self.mute_all();
 
-        // Get reference to active stream's sink for unmuting later
-        let active_sink = self.active_index.and_then(|idx| {
-            self.streams[idx].as_ref().map(|sh| sh.sink.clone())
-        });
+        // Collect all sink references for unmuting later
+        let sinks: Vec<Arc<Mutex<Option<Arc<Sink>>>>> = self.streams
+            .iter()
+            .filter_map(|s| s.as_ref().map(|sh| sh.sink.clone()))
+            .collect();
+
+        // Clone active_index Arc so TTS thread can read current value after completion
+        let active_index = self.active_index.clone();
 
         let text = text.to_string();
         let tts = tts.clone();
@@ -351,12 +379,21 @@ impl MultiStreamPlayer {
                 }
             }
 
-            // Unmute the stream after TTS completes
-            if let Some(sink_mutex) = active_sink {
+            // Mute all, then unmute only the CURRENT active stream
+            for sink_mutex in &sinks {
                 if let Ok(sink_guard) = sink_mutex.lock() {
                     if let Some(ref sink) = *sink_guard {
+                        sink.set_volume(MUTED_VOLUME);
+                    }
+                }
+            }
+
+            let idx = active_index.load(Ordering::SeqCst);
+            if idx != NO_ACTIVE_STREAM && idx < sinks.len() {
+                if let Ok(sink_guard) = sinks[idx].lock() {
+                    if let Some(ref sink) = *sink_guard {
                         sink.set_volume(VOLUME);
-                        debug!("Unmuted stream after TTS");
+                        debug!("Unmuted stream {} after TTS", idx);
                     }
                 }
             }
@@ -450,14 +487,15 @@ impl MultiStreamPlayer {
             }
         }
 
-        self.active_index = None;
+        self.active_index.store(NO_ACTIVE_STREAM, Ordering::SeqCst);
         debug!("All streams disconnected");
     }
 
     /// Check if active stream has an error
     /// Returns true if the active stream is in error state
     pub fn active_stream_has_error(&self) -> bool {
-        if let Some(idx) = self.active_index {
+        let idx = self.active_index.load(Ordering::SeqCst);
+        if idx != NO_ACTIVE_STREAM {
             self.stream_status(idx) == Some(STREAM_STATUS_ERROR)
         } else {
             false
@@ -481,7 +519,7 @@ impl MultiStreamPlayer {
                 // Set volume based on whether this is the active stream
                 if let Ok(sink_guard) = handle.sink.lock() {
                     if let Some(ref sink) = *sink_guard {
-                        let volume = if self.active_index == Some(index) {
+                        let volume = if self.active_index.load(Ordering::SeqCst) == index {
                             VOLUME
                         } else {
                             MUTED_VOLUME
@@ -504,9 +542,10 @@ impl MultiStreamPlayer {
     /// Tries 3 times with 1s, 2s, 4s delays
     /// Returns true if reconnection was successful
     pub fn reconnect_active_with_backoff(&mut self, channel: &crate::channels::Channel) -> bool {
-        let Some(idx) = self.active_index else {
+        let idx = self.active_index.load(Ordering::SeqCst);
+        if idx == NO_ACTIVE_STREAM {
             return false;
-        };
+        }
 
         let delays = [1, 2, 4]; // seconds
         for (attempt, delay_secs) in delays.iter().enumerate() {
