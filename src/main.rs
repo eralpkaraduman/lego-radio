@@ -151,9 +151,10 @@ fn run_radio() -> Result<()> {
                 let channel = &channels::CHANNELS[idx];
                 info!("Channel {}: {}", idx + 1, channel.name);
 
-                // Select first (sets active_index), then speak (mutes the NEW active stream)
+                // Mute all first (prevents brief audio blip), then select, then speak
+                player.mute_all();
                 player.select(idx);
-                player.speak(channel.tts_name, &tts);  // Mutes new channel, unmutes after TTS
+                player.speak(channel.tts_name, &tts);  // Spawns TTS, unmutes after completion
 
                 // Check if stream is in error state and needs reconnection
                 if player.active_stream_has_error() {
