@@ -5,9 +5,20 @@ A LEGO-based internet radio with single button control, powered by Raspberry Pi.
 ## Features
 
 - Single button cycles through radio channels
-- Text-to-speech announces each channel
+- Text-to-speech announces each channel (interruptible)
+- Instant beep feedback on button press
 - Self-updating binary
 - Runs as a systemd service
+
+## Architecture
+
+Simple state machine: `Welcome → Channel 1 → ... → Channel N → Off → (repeat)`
+
+**Connect-on-demand design:**
+- One stream at a time (no pre-buffering)
+- Button press → immediate beep → stop current stream → announce next channel → connect
+- TTS is interruptible - press button to skip to next state
+- Minimal resource usage in Off state (just input thread waiting)
 
 ## Hardware
 
