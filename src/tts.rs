@@ -1,16 +1,22 @@
 use anyhow::{anyhow, Result};
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 /// TTS engine selection (determined once at boot)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TtsEngine {
+    /// Native piper binary (Linux, or macOS with working binary)
     Piper,
+    /// Docker-based piper (macOS fallback)
+    #[cfg(target_os = "macos")]
+    DockerPiper,
+    /// macOS say command (last resort fallback)
     #[cfg(target_os = "macos")]
     MacSay,
+    /// No TTS available
     None,
 }
 
@@ -27,7 +33,7 @@ impl PiperTts {
     /// Create a new PiperTts instance, downloading required files if needed
     /// Tests TTS capability once at boot and remembers the result
     pub fn new() -> Result<Self> {
-        // Check if piper is installed system-wide (e.g., in Docker)
+        // Check if piper is installed system-wide (e.g., in Docker on Pi)
         if let Some(mut tts) = Self::try_system_piper()? {
             if tts.test_piper() {
                 info!("Using system-installed piper");
@@ -51,29 +57,37 @@ impl PiperTts {
             engine: TtsEngine::None,
         };
 
-        // Download piper if needed
-        if !tts.piper_path.exists() {
-            tts.download_piper()?;
-        }
-
-        // Download voice model if needed
+        // Download voice model if needed (used by all engines)
         if !tts.model_path.exists() {
             tts.download_voice()?;
         }
 
-        // Test if piper works (check once at boot)
+        // Download native piper if needed
+        if !tts.piper_path.exists() {
+            tts.download_piper()?;
+        }
+
+        // Test engines in order of preference
         if tts.test_piper() {
-            info!("TTS engine: Piper");
+            info!("TTS engine: Piper (native)");
             tts.engine = TtsEngine::Piper;
         } else {
             #[cfg(target_os = "macos")]
             {
-                info!("Piper not working, TTS engine: macOS say");
-                tts.engine = TtsEngine::MacSay;
+                if tts.test_docker_piper() {
+                    info!("TTS engine: Piper (Docker)");
+                    tts.engine = TtsEngine::DockerPiper;
+                } else if tts.test_say() {
+                    info!("TTS engine: macOS say");
+                    tts.engine = TtsEngine::MacSay;
+                } else {
+                    warn!("No TTS engine available");
+                    tts.engine = TtsEngine::None;
+                }
             }
             #[cfg(not(target_os = "macos"))]
             {
-                info!("Piper not working, TTS disabled");
+                warn!("Piper not working, TTS disabled");
                 tts.engine = TtsEngine::None;
             }
         }
@@ -81,22 +95,67 @@ impl PiperTts {
         Ok(tts)
     }
 
-    /// Test if piper works by synthesizing a short test
+    /// Test if native piper works
     fn test_piper(&self) -> bool {
-        debug!("Testing Piper TTS...");
+        debug!("Testing native Piper...");
         match self.synthesize_with_piper("test") {
             Ok(samples) => {
-                debug!("Piper test successful, got {} samples", samples.len());
-                samples.len() > 0
+                debug!("Native Piper test successful, got {} samples", samples.len());
+                !samples.is_empty()
             }
             Err(e) => {
-                debug!("Piper test failed: {}", e);
+                debug!("Native Piper test failed: {}", e);
                 false
             }
         }
     }
 
-    /// Try to use system-installed piper (e.g., in Docker)
+    /// Test if Docker piper works
+    #[cfg(target_os = "macos")]
+    fn test_docker_piper(&self) -> bool {
+        debug!("Testing Docker Piper...");
+
+        // Check if Docker is available
+        if Command::new("docker").arg("--version").output().is_err() {
+            debug!("Docker not available");
+            return false;
+        }
+
+        // Check if our piper image exists
+        let output = Command::new("docker")
+            .args(["images", "-q", "lego-radio-piper"])
+            .output();
+
+        match output {
+            Ok(o) if !o.stdout.is_empty() => {
+                debug!("Docker Piper image found");
+                // Test synthesis
+                match self.synthesize_with_docker_piper("test") {
+                    Ok(samples) => {
+                        debug!("Docker Piper test successful, got {} samples", samples.len());
+                        !samples.is_empty()
+                    }
+                    Err(e) => {
+                        debug!("Docker Piper test failed: {}", e);
+                        false
+                    }
+                }
+            }
+            _ => {
+                info!("Docker Piper image not found. Build it with: docker build -f Dockerfile.piper -t lego-radio-piper .");
+                false
+            }
+        }
+    }
+
+    /// Test if macOS say works
+    #[cfg(target_os = "macos")]
+    fn test_say(&self) -> bool {
+        debug!("Testing macOS say...");
+        Command::new("say").arg("test").output().is_ok()
+    }
+
+    /// Try to use system-installed piper (e.g., in Docker on Pi)
     fn try_system_piper() -> Result<Option<Self>> {
         let system_paths = [
             PathBuf::from("/opt/piper"),
@@ -126,12 +185,14 @@ impl PiperTts {
         match self.engine {
             TtsEngine::Piper => self.synthesize_with_piper(text),
             #[cfg(target_os = "macos")]
+            TtsEngine::DockerPiper => self.synthesize_with_docker_piper(text),
+            #[cfg(target_os = "macos")]
             TtsEngine::MacSay => self.synthesize_with_say(text),
             TtsEngine::None => Err(anyhow!("No TTS engine available")),
         }
     }
 
-    /// Synthesize using Piper
+    /// Synthesize using native Piper binary
     fn synthesize_with_piper(&self, text: &str) -> Result<Vec<i16>> {
         debug!("Piper TTS: {}", text);
 
@@ -142,10 +203,7 @@ impl PiperTts {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        // Set library path for espeak-ng
-        #[cfg(target_os = "macos")]
-        cmd.env("DYLD_LIBRARY_PATH", "/opt/homebrew/lib:/usr/local/lib");
-
+        // Set library path
         #[cfg(target_os = "linux")]
         cmd.env(
             "LD_LIBRARY_PATH",
@@ -177,7 +235,49 @@ impl PiperTts {
         Ok(samples)
     }
 
-    /// Speak using macOS say command (blocking)
+    /// Synthesize using Docker Piper (for macOS)
+    #[cfg(target_os = "macos")]
+    fn synthesize_with_docker_piper(&self, text: &str) -> Result<Vec<i16>> {
+        debug!("Docker Piper TTS: {}", text);
+
+        let data_dir = get_data_dir()?;
+
+        let mut child = Command::new("docker")
+            .args([
+                "run", "--rm", "-i",
+                "-v", &format!("{}:/data", data_dir.display()),
+                "lego-radio-piper",
+                "--model", "/data/en_US-lessac-medium.onnx",
+                "--output-raw",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow!("Failed to run docker piper: {}", e))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(text.as_bytes())?;
+        }
+
+        let output = child.wait_with_output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!("Docker Piper failed: {}", stderr));
+        }
+
+        // Convert bytes to i16 samples (little-endian)
+        let samples: Vec<i16> = output
+            .stdout
+            .chunks_exact(2)
+            .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+
+        Ok(samples)
+    }
+
+    /// Speak using macOS say command (blocking, plays directly)
     #[cfg(target_os = "macos")]
     fn synthesize_with_say(&self, text: &str) -> Result<Vec<i16>> {
         debug!("macOS say: {}", text);
@@ -269,7 +369,7 @@ fn get_piper_download_url() -> Result<String> {
         ("linux", "x86_64") => "piper_linux_x86_64.tar.gz",
         ("linux", "arm") => "piper_linux_armv7l.tar.gz",
         ("macos", "aarch64") => "piper_macos_aarch64.tar.gz",
-        ("macos", "x86_64") => "piper_macos_x86_64.tar.gz",
+        ("macos", "x86_64") => "piper_macos_x64.tar.gz",
         _ => return Err(anyhow!("Unsupported platform: {}-{}", os, arch)),
     };
 

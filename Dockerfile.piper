@@ -1,0 +1,19 @@
+# Lightweight Piper TTS container for macOS development
+# Build: docker build -f Dockerfile.piper -t lego-radio-piper .
+# Usage: echo "text" | docker run --rm -i -v ~/.local/share/lego-radio:/data lego-radio-piper --model /data/en_US-lessac-medium.onnx --output-raw
+
+FROM --platform=linux/amd64 debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Download and install piper
+RUN curl -sL "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_x86_64.tar.gz" | \
+    tar xz -C /opt && \
+    chmod +x /opt/piper/piper
+
+ENV LD_LIBRARY_PATH=/opt/piper
+
+ENTRYPOINT ["/opt/piper/piper"]
