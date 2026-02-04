@@ -9,19 +9,25 @@ A simple internet radio with N channels, controlled by a single button. Press to
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           Audio Pipeline                                 │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  [HTTP 0] ──→ [Ring Buffer 0] ──┐                                       │
-│  [HTTP 1] ──→ [Ring Buffer 1] ──┼──→ [Single Decoder] ──→ [Sink] ──→ 🔊│
-│  [HTTP 2] ──→ [Ring Buffer 2] ──┤         ↑                             │
-│  [HTTP N] ──→ [Ring Buffer N] ──┘         │                             │
-│                                           │                             │
-│  [TTS Synthesize] ────────────────────────┘                             │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph Downloads
+        HTTP0[HTTP 0] --> BUF0[Ring Buffer 0]
+        HTTP1[HTTP 1] --> BUF1[Ring Buffer 1]
+        HTTP2[HTTP 2] --> BUF2[Ring Buffer 2]
+        HTTPN[HTTP N] --> BUFN[Ring Buffer N]
+    end
+
+    subgraph Pipeline
+        BUF0 --> MUX{Active Buffer}
+        BUF1 --> MUX
+        BUF2 --> MUX
+        BUFN --> MUX
+        MUX --> DEC[Single Decoder]
+        DEC --> SINK[Sink]
+        TTS[TTS Synthesize] --> SINK
+        SINK --> OUT[Audio Out]
+    end
 ```
 
 **Key Properties:**
@@ -39,60 +45,60 @@ stateDiagram-v2
 
     state Boot {
         [*] --> InitLogger
-        InitLogger --> InitTTS: Downloads Piper if needed
-        InitTTS --> InitAudio: Creates single sink
-        InitAudio --> SpawnInputThread: mpsc channel created
+        InitLogger --> InitTTS
+        InitTTS --> InitAudio
+        InitAudio --> SpawnInputThread
         SpawnInputThread --> [*]
     }
 
-    Boot --> Welcome: Auto (no button press)
+    Boot --> Welcome
 
     state Welcome {
-        [*] --> SayHello: "Hello!"
-        SayHello --> SayCheckingUpdates: "Checking for updates. Please wait."
+        [*] --> SayHello
+        SayHello --> SayCheckingUpdates
         SayCheckingUpdates --> CheckUpdates
 
         state UpdateCheck <<choice>>
         CheckUpdates --> UpdateCheck
-        UpdateCheck --> Installing: Update available
-        UpdateCheck --> UpToDate: No update
+        UpdateCheck --> Installing : Update available
+        UpdateCheck --> UpToDate : No update
 
         Installing --> InstallResult
 
         state InstallResult <<choice>>
-        InstallResult --> Exit: Success
-        InstallResult --> PromptStart: Failure
+        InstallResult --> Exit : Success
+        InstallResult --> PromptStart : Failure
 
-        Exit --> [*]: process::exit(0)\nsystemd restarts
-        UpToDate --> SayUpToDate: "Up to date."
+        Exit --> [*]
+        UpToDate --> SayUpToDate
         SayUpToDate --> StartDownloads
-        StartDownloads --> SayConnected: "Connecting to stations. Please wait."
-        SayConnected --> PromptStart: "Connected N out of M stations."
-        PromptStart --> WaitForPress: "Change channel to start playing."
+        StartDownloads --> SayConnected
+        SayConnected --> PromptStart
+        PromptStart --> WaitForPress
         WaitForPress --> [*]
     }
 
-    Welcome --> Playing: Button press
+    Welcome --> Playing : Button press
 
     state Playing {
-        [*] --> Announce: TTS channel name
-        Announce --> SwitchBuffer: Decoder reads from new buffer
-        SwitchBuffer --> Playback: Audio flows
+        [*] --> Announce
+        Announce --> SwitchBuffer
+        SwitchBuffer --> Playback
         Playback --> [*]
     }
 
-    Playing --> Playing: Button press (next channel)
-    Playing --> Off: Button press (after last channel)
+    Playing --> Playing : Next channel
+    Playing --> Off : After last channel
 
     state Off {
-        [*] --> StopDecoder: Decoder stops
-        StopDecoder --> SayOff: "Radio off"
-        SayOff --> StopDownloads: All HTTP downloads stop
-        StopDownloads --> Idle: 0 bandwidth, 0 CPU
+        [*] --> StopDecoder
+        StopDecoder --> SayOff
+        SayOff --> StopDownloads
+        StopDownloads --> Idle
         Idle --> [*]
     }
 
-    Off --> Welcome: Button press (reconnects)
+    Off --> Welcome : Button press
 ```
 
 ## RadioState Enum
@@ -183,7 +189,7 @@ Each channel has a ring buffer storing ~3 seconds of compressed audio:
 
 ```rust
 struct RingBuffer {
-    data: [u8; BUFFER_SIZE],      // ~384KB for 3s @ 128kbps
+    data: [u8; BUFFER_SIZE],      // ~48KB for 3s @ 128kbps
     write_pos: AtomicUsize,       // Where downloader writes
     read_pos: AtomicUsize,        // Where decoder reads
 }
@@ -320,31 +326,23 @@ pub fn disconnect_all(&mut self) {
 ## Button Input (Trailing Edge Debounce)
 
 ```mermaid
-stateDiagram-v2
-    [*] --> WaitForPress
+flowchart TB
+    subgraph InputThread[Input Thread]
+        WFP[Wait for Press] --> PD[Press Detected]
+        PD --> DB[Debounce 150ms]
+        DB -->|Another press| DB
+        DB -->|150ms idle| SEND[Send to Channel]
+        SEND --> WFP
+    end
 
-    state "Input Thread" as Input {
-        WaitForPress --> PressDetected: Pin LOW
+    subgraph MainThread[Main Thread]
+        BLOCK[Blocked on recv] --> GOT[Got Press]
+        GOT --> DRAIN[Drain Extras]
+        DRAIN --> PROC[Process State]
+        PROC --> BLOCK
+    end
 
-        state "Trailing Edge Debounce" as Debounce {
-            [*] --> TimerRunning
-            TimerRunning --> TimerRunning: Another press\n(reset to 0)
-            TimerRunning --> Complete: 150ms idle
-        }
-
-        PressDetected --> Debounce
-        Debounce --> SendToChannel: tx.send(())
-        SendToChannel --> WaitForPress
-    }
-
-    state "Main Thread" as Main {
-        Blocked --> GotPress: rx.recv()
-        GotPress --> DrainExtras: while rx.try_recv().is_ok()
-        DrainExtras --> ProcessState: state.next()
-        ProcessState --> Blocked
-    }
-
-    Input --> Main: mpsc channel
+    SEND -.->|mpsc| BLOCK
 ```
 
 **Debounce Behavior:**
@@ -356,21 +354,17 @@ stateDiagram-v2
 ## TTS Subsystem
 
 ```mermaid
-stateDiagram-v2
-    [*] --> EngineSelection: Boot
-
-    state EngineSelection {
-        [*] --> CheckSystemPiper
-        CheckSystemPiper --> TestPiper: Found /opt/piper
-        CheckSystemPiper --> DownloadPiper: Not found
-
-        DownloadPiper --> TestPiper
-        TestPiper --> UsePiper: Works
-        TestPiper --> UseMacSay: Fails (macOS)
-        TestPiper --> NoTTS: Fails (other)
-    }
-
-    EngineSelection --> Ready: engine field set
+flowchart TB
+    START[Boot] --> CHECK[Check System Piper]
+    CHECK -->|Found| TEST[Test Piper]
+    CHECK -->|Not found| DL[Download Piper]
+    DL --> TEST
+    TEST -->|Works| PIPER[Use Piper]
+    TEST -->|Fails macOS| SAY[Use macOS say]
+    TEST -->|Fails other| NONE[No TTS]
+    PIPER --> READY[Ready]
+    SAY --> READY
+    NONE --> READY
 ```
 
 **TTS Engine Selection (checked once at boot):**
@@ -390,47 +384,43 @@ stateDiagram-v2
 
 ```mermaid
 flowchart TB
-    subgraph "Main Thread"
-        ML[Main Loop]
-        ML --> WB[rx.recv - block]
+    subgraph Main[Main Thread]
+        ML[Main Loop] --> WB[Block on recv]
         WB --> DR[Drain extras]
-        DR --> ST[state.next]
-        ST --> PC[match state]
+        DR --> ST[State transition]
+        ST --> PC[Match state]
         PC --> ML
     end
 
-    subgraph "Input Thread (spawned once)"
-        BL[Button Loop]
-        BL --> DP[Debounce 150ms]
-        DP --> TX[tx.send]
+    subgraph Input[Input Thread]
+        BL[Button Loop] --> DP[Debounce]
+        DP --> TX[Send event]
         TX --> BL
     end
 
-    subgraph "Download Threads (N when connected)"
+    subgraph Downloads[Download Threads N]
         DL0[Download 0] --> BUF0[Buffer 0]
         DL1[Download 1] --> BUF1[Buffer 1]
         DLN[Download N] --> BUFN[Buffer N]
     end
 
-    subgraph "Decoder Thread (1 when playing)"
-        DEC[Decode from active buffer]
-        DEC --> SINK[Single Sink]
+    subgraph Decoder[Decoder Thread]
+        DEC[Decode active buffer] --> SINK[Single Sink]
     end
 
-    subgraph "TTS (inline on main thread)"
-        TTS[Synthesize + play]
-        TTS --> SINK
+    subgraph TTS[TTS on Main]
+        TTSP[Synthesize and play] --> SINK
     end
 
     TX -.->|mpsc| WB
     PC -->|select| DEC
-    PC -->|announce| TTS
+    PC -->|announce| TTSP
 ```
 
 **Thread Summary:**
 | Thread | Lifetime | Purpose |
 |--------|----------|---------|
-| Main | Forever | State machine, blocking on rx.recv() |
+| Main | Forever | State machine, blocking on recv |
 | Input | Forever | Debounce button, send to channel |
 | Download 0..N | While connected | HTTP download to ring buffer |
 | Decoder | While playing | Decode from active buffer to sink |
@@ -442,8 +432,8 @@ flowchart TB
 |----------|-------------------|
 | Threads | 3 + N (main + input + decoder + N downloaders) |
 | CPU | ~5-8% on Pi 4 (1 decoder + N network I/O) |
-| Bandwidth | N × 128 kbps |
-| Memory | ~2 MB + N × 384 KB (ring buffers) |
+| Bandwidth | N x 128 kbps |
+| Memory | ~2 MB + N x 48 KB (ring buffers) |
 
 **Comparison with old multi-decode architecture:**
 | Metric | Old (N decoders) | New (1 decoder) |
@@ -486,6 +476,18 @@ Defined in `src/channels.rs`:
 TTS names spell out abbreviations for natural speech.
 
 ## Error Recovery
+
+```mermaid
+flowchart TB
+    FAIL[Download Fails] --> BUFFER[Decoder plays from buffer]
+    BUFFER --> RETRY[Retry with backoff 1s 2s 4s]
+    RETRY -->|Success| RESUME[Seamless resume]
+    RETRY -->|Buffer empty| ANNOUNCE[TTS Reconnecting]
+    ANNOUNCE --> RETRY2[Keep retrying]
+    RETRY2 -->|Success| RESUME
+    RETRY2 -->|3 failures| UNAVAIL[TTS Station unavailable]
+    UNAVAIL --> SKIP[Skip to next channel]
+```
 
 When a download fails:
 1. Decoder continues playing from buffer (has ~3 seconds)
