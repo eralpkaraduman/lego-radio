@@ -11,11 +11,11 @@ use std::process::{Command, Stdio};
 
 /// Piper voice model name (without .onnx extension)
 /// Browse voices at: https://huggingface.co/rhasspy/piper-voices/tree/main/en
-const VOICE_MODEL: &str = "en_US-joe-medium";
+const VOICE_MODEL: &str = "en_GB-alan-medium";
 
 /// Base URL for downloading the voice model
 const VOICE_BASE_URL: &str =
-    "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/joe/medium";
+    "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/alan/medium";
 
 // =============================================================================
 

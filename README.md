@@ -112,8 +112,8 @@ Edit `src/tts.rs` to change the Piper voice:
 
 ```rust
 // Voice Configuration
-const VOICE_MODEL: &str = "en_US-joe-medium";
-const VOICE_BASE_URL: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/joe/medium";
+const VOICE_MODEL: &str = "en_GB-alan-medium";
+const VOICE_BASE_URL: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/alan/medium";
 ```
 
 Browse available voices at: https://huggingface.co/rhasspy/piper-voices/tree/main/en
