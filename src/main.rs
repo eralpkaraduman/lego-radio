@@ -470,13 +470,11 @@ fn set_system_volume(volume: u8) -> Result<()> {
         match result {
             Ok(output) if output.status.success() => {
                 println!("Volume set successfully (PipeWire/PulseAudio)");
-                return Ok(());
+                Ok(())
             }
-            _ => {
-                return Err(anyhow::anyhow!(
-                    "Failed to set volume. No working audio control found."
-                ));
-            }
+            _ => Err(anyhow::anyhow!(
+                "Failed to set volume. No working audio control found."
+            )),
         }
     }
 
