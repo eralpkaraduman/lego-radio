@@ -21,7 +21,7 @@ const VOICE_BASE_URL: &str =
 
 /// TTS engine selection (determined once at boot)
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)]  // Variants are platform-specific
+#[allow(dead_code)] // Variants are platform-specific
 pub enum TtsEngine {
     /// Native piper binary (Linux only)
     Piper,
@@ -151,7 +151,10 @@ impl PiperTts {
         debug!("Testing native Piper...");
         match self.synthesize_with_piper("test") {
             Ok(samples) => {
-                debug!("Native Piper test successful, got {} samples", samples.len());
+                debug!(
+                    "Native Piper test successful, got {} samples",
+                    samples.len()
+                );
                 !samples.is_empty()
             }
             Err(e) => {
@@ -183,7 +186,10 @@ impl PiperTts {
                 // Test synthesis
                 match self.synthesize_with_docker_piper("test") {
                     Ok(samples) => {
-                        debug!("Docker Piper test successful, got {} samples", samples.len());
+                        debug!(
+                            "Docker Piper test successful, got {} samples",
+                            samples.len()
+                        );
                         !samples.is_empty()
                     }
                     Err(e) => {
@@ -287,10 +293,14 @@ impl PiperTts {
 
         let mut child = Command::new("docker")
             .args([
-                "run", "--rm", "-i",
-                "-v", &format!("{}:/data", data_dir.display()),
+                "run",
+                "--rm",
+                "-i",
+                "-v",
+                &format!("{}:/data", data_dir.display()),
                 "lego-radio-piper",
-                "--model", &format!("/data/{}.onnx", VOICE_MODEL),
+                "--model",
+                &format!("/data/{}.onnx", VOICE_MODEL),
                 "--output-raw",
             ])
             .stdin(Stdio::piped())
@@ -384,7 +394,9 @@ fn get_data_dir() -> Result<PathBuf> {
         return Ok(fallback);
     }
 
-    Err(anyhow!("Cannot determine data directory: HOME not set and /var/lib/lego-radio not writable"))
+    Err(anyhow!(
+        "Cannot determine data directory: HOME not set and /var/lib/lego-radio not writable"
+    ))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -439,6 +451,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::const_is_empty)]
     fn test_voice_config() {
         assert!(!VOICE_MODEL.is_empty());
         assert!(VOICE_BASE_URL.starts_with("https://"));

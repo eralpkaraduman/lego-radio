@@ -59,13 +59,14 @@ fn main() -> Result<()> {
             return test_tts();
         }
         Some("--test-stream") => {
-            let url = args.get(2).map(|s| s.as_str()).unwrap_or(channels::CHANNELS[0].url);
+            let url = args
+                .get(2)
+                .map(|s| s.as_str())
+                .unwrap_or(channels::CHANNELS[0].url);
             return test_stream(url);
         }
         Some("--set-volume") => {
-            let volume = args.get(2)
-                .and_then(|s| s.parse::<u8>().ok())
-                .unwrap_or(80);
+            let volume = args.get(2).and_then(|s| s.parse::<u8>().ok()).unwrap_or(80);
             return set_system_volume(volume);
         }
         _ => {}
@@ -137,7 +138,7 @@ fn run_radio() -> Result<()> {
     // Drain any button presses that happened during welcome
     while rx.try_recv().is_ok() {}
 
-    let mut skip_wait = false;  // Skip waiting for button press (after interrupt)
+    let mut skip_wait = false; // Skip waiting for button press (after interrupt)
 
     loop {
         if !skip_wait {
@@ -156,7 +157,7 @@ fn run_radio() -> Result<()> {
             // Transition to next state
             state = state.next(num_channels);
         }
-        skip_wait = false;  // Reset flag
+        skip_wait = false; // Reset flag
 
         info!("State: {:?}", state);
 
@@ -173,7 +174,7 @@ fn run_radio() -> Result<()> {
                     state = state.next(num_channels);
                     pipeline.stop();
                     pipeline.beep();
-                    skip_wait = true;  // Don't wait, process new state now
+                    skip_wait = true; // Don't wait, process new state now
                     continue;
                 }
             }
@@ -191,9 +192,9 @@ fn run_radio() -> Result<()> {
 const STREAM_CHECK_INTERVAL_MS: u64 = 500;
 
 /// Reconnection strategy with exponential backoff
-const RECONNECT_INITIAL_SECS: u64 = 2;    // Start with 2 second retry
-const RECONNECT_MAX_SECS: u64 = 60;       // Cap at 60 seconds
-const RECONNECT_SILENT_RETRIES: u32 = 3;  // Silent retries before announcing
+const RECONNECT_INITIAL_SECS: u64 = 2; // Start with 2 second retry
+const RECONNECT_MAX_SECS: u64 = 60; // Cap at 60 seconds
+const RECONNECT_SILENT_RETRIES: u32 = 3; // Silent retries before announcing
 
 /// Play a channel with interrupt support and auto-reconnect
 /// Returns false if interrupted (caller should continue loop)
@@ -253,32 +254,41 @@ fn play_channel(
 
             if retry_count > RECONNECT_SILENT_RETRIES {
                 // Announce only after silent retries exhausted
-                if !pipeline.announce_interruptible("Connection lost. Reconnecting.", tts, Some(rx)) {
+                if !pipeline.announce_interruptible("Connection lost. Reconnecting.", tts, Some(rx))
+                {
                     info!("Interrupted during reconnect announcement");
                     return false;
                 }
             } else {
-                info!("Silent reconnect attempt {} of {}", retry_count, RECONNECT_SILENT_RETRIES);
+                info!(
+                    "Silent reconnect attempt {} of {}",
+                    retry_count, RECONNECT_SILENT_RETRIES
+                );
             }
         } else {
             // Connection failed
             retry_count += 1;
 
             if retry_count > RECONNECT_SILENT_RETRIES {
-                error!("Connection failed for {} (attempt {})", channel.name, retry_count);
+                error!(
+                    "Connection failed for {} (attempt {})",
+                    channel.name, retry_count
+                );
                 if !pipeline.announce_interruptible("Connection failed. Retrying.", tts, Some(rx)) {
                     info!("Interrupted during retry announcement");
                     return false;
                 }
             } else {
-                info!("Silent retry {} of {} for {}", retry_count, RECONNECT_SILENT_RETRIES, channel.name);
+                info!(
+                    "Silent retry {} of {} for {}",
+                    retry_count, RECONNECT_SILENT_RETRIES, channel.name
+                );
             }
         }
 
         // Wait before retry with exponential backoff, checking for interrupts
         info!("Waiting {}s before reconnect attempt", retry_interval);
-        let wait_until = std::time::Instant::now()
-            + std::time::Duration::from_secs(retry_interval);
+        let wait_until = std::time::Instant::now() + std::time::Duration::from_secs(retry_interval);
 
         while std::time::Instant::now() < wait_until {
             if rx.try_recv().is_ok() {
@@ -403,7 +413,9 @@ fn set_system_volume(volume: u8) -> Result<()> {
                 return Ok(());
             }
             _ => {
-                return Err(anyhow::anyhow!("Failed to set volume. No working audio control found."));
+                return Err(anyhow::anyhow!(
+                    "Failed to set volume. No working audio control found."
+                ));
             }
         }
     }

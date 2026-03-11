@@ -83,6 +83,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::const_is_empty)]
     fn test_channels_not_empty() {
         assert!(!CHANNELS.is_empty(), "Must have at least one channel");
     }

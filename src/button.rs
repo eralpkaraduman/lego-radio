@@ -44,7 +44,6 @@ impl Default for ButtonConfig {
     }
 }
 
-
 /// Keyboard pin reader - reports key presses as Low, otherwise High
 /// Each key press sets a flag that is cleared after being read once as Low
 pub struct KeyboardPinReader {
@@ -158,7 +157,10 @@ impl<P: PinReader> GenericGpioButton<P> {
         loop {
             let level = self.pin.read();
             if level == PinLevel::Low {
-                info!("Button: Press detected, waiting for {}ms idle...", self.config.debounce_ms);
+                info!(
+                    "Button: Press detected, waiting for {}ms idle...",
+                    self.config.debounce_ms
+                );
                 break;
             }
             thread::sleep(poll);
@@ -178,7 +180,10 @@ impl<P: PinReader> GenericGpioButton<P> {
 
             if last_press.elapsed() >= debounce {
                 // Idle achieved - register the press
-                info!("Button: Press registered (after {}ms idle)", self.config.debounce_ms);
+                info!(
+                    "Button: Press registered (after {}ms idle)",
+                    self.config.debounce_ms
+                );
                 return;
             }
 
@@ -228,10 +233,7 @@ impl GpioButton {
         let pin = gpio.get(pin_number)?.into_input_pullup();
 
         Ok(Self {
-            inner: GenericGpioButton::new(
-                RppalPin { pin },
-                ButtonConfig::default(),
-            ),
+            inner: GenericGpioButton::new(RppalPin { pin }, ButtonConfig::default()),
         })
     }
 }
@@ -290,7 +292,10 @@ mod tests {
     impl PinReader for MockPin {
         fn read(&self) -> PinLevel {
             let idx = self.index.fetch_add(1, Ordering::SeqCst);
-            self.levels.get(idx).copied().unwrap_or(*self.levels.last().unwrap())
+            self.levels
+                .get(idx)
+                .copied()
+                .unwrap_or(*self.levels.last().unwrap())
         }
     }
 

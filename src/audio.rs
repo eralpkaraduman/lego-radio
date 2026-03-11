@@ -69,8 +69,7 @@ impl AudioPipeline {
             .map_err(|e| anyhow!("Failed to open audio output: {}", e))?;
 
         let sink = Arc::new(
-            Sink::try_new(&stream_handle)
-                .map_err(|e| anyhow!("Failed to create sink: {}", e))?
+            Sink::try_new(&stream_handle).map_err(|e| anyhow!("Failed to create sink: {}", e))?,
         );
         sink.set_volume(VOLUME);
 
@@ -97,7 +96,7 @@ impl AudioPipeline {
 
         // Clear any queued audio immediately
         self.sink.clear();
-        self.sink.play();  // Reset paused state if any
+        self.sink.play(); // Reset paused state if any
     }
 
     /// Connect to a URL and start playing
@@ -177,8 +176,8 @@ impl AudioPipeline {
 
         let source = SamplesBuffer::new(1, sample_rate, samples);
         self.sink.append(source);
-        self.sink.play();  // Ensure not paused
-        self.sink.sleep_until_end();  // Wait for beep to play
+        self.sink.play(); // Ensure not paused
+        self.sink.sleep_until_end(); // Wait for beep to play
     }
 
     /// Play TTS announcement
@@ -297,13 +296,14 @@ fn stream_loop(
     let metadata_opts = MetadataOptions::default();
     let hint = Hint::new();
 
-    let probed = match symphonia::default::get_probe().format(&hint, mss, &format_opts, &metadata_opts) {
-        Ok(p) => p,
-        Err(e) => {
-            error!("Failed to probe format: {}", e);
-            return;
-        }
-    };
+    let probed =
+        match symphonia::default::get_probe().format(&hint, mss, &format_opts, &metadata_opts) {
+            Ok(p) => p,
+            Err(e) => {
+                error!("Failed to probe format: {}", e);
+                return;
+            }
+        };
 
     let mut format = probed.format;
 
@@ -427,7 +427,8 @@ struct HlsReader {
 impl HlsReader {
     fn new(url: &str, stop_flag: Arc<AtomicBool>) -> Result<Self, std::io::Error> {
         // Extract base URL (everything up to last /)
-        let base_url = url.rsplit_once('/')
+        let base_url = url
+            .rsplit_once('/')
             .map(|(base, _)| format!("{}/", base))
             .unwrap_or_else(|| url.to_string());
 
@@ -457,14 +458,15 @@ impl HlsReader {
         let response = ureq::get(&self.playlist_url)
             .set("User-Agent", "lego-radio/1.0")
             .call()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         let mut body = String::new();
         response.into_reader().read_to_string(&mut body)?;
 
         // Parse playlist using m3u8-rs
-        let parsed = m3u8_rs::parse_playlist_res(body.as_bytes())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{:?}", e)))?;
+        let parsed = m3u8_rs::parse_playlist_res(body.as_bytes()).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{:?}", e))
+        })?;
 
         match parsed {
             m3u8_rs::Playlist::MediaPlaylist(playlist) => {
@@ -498,7 +500,8 @@ impl HlsReader {
                     };
                     debug!("HLS: following master playlist to {}", variant_url);
                     self.playlist_url = variant_url.clone();
-                    self.base_url = variant_url.rsplit_once('/')
+                    self.base_url = variant_url
+                        .rsplit_once('/')
                         .map(|(base, _)| format!("{}/", base))
                         .unwrap_or(self.base_url.clone());
                     return self.refresh_playlist();
@@ -536,7 +539,7 @@ impl HlsReader {
         let response = ureq::get(segment_url)
             .set("User-Agent", "lego-radio/1.0")
             .call()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         let mut data = Vec::new();
         response.into_reader().read_to_end(&mut data)?;
@@ -612,24 +615,27 @@ fn demux_ts_audio(ts_data: &[u8]) -> Vec<u8> {
         let payload = &chunk[offset..];
 
         // Check for PES header (starts with 0x00 0x00 0x01)
-        if payload_start && payload.len() >= 9 {
-            if payload[0] == 0x00 && payload[1] == 0x00 && payload[2] == 0x01 {
-                let stream_id = payload[3];
+        if payload_start
+            && payload.len() >= 9
+            && payload[0] == 0x00
+            && payload[1] == 0x00
+            && payload[2] == 0x01
+        {
+            let stream_id = payload[3];
 
-                // Audio stream IDs: 0xC0-0xDF (MPEG audio), 0xBD (private/AAC)
-                if (stream_id >= 0xC0 && stream_id <= 0xDF) || stream_id == 0xBD {
-                    if audio_pid.is_none() {
-                        audio_pid = Some(pid);
-                        debug!("HLS: found audio on PID {}", pid);
-                    }
-
-                    // Skip PES header to get to audio data
-                    let pes_header_len = 9 + payload[8] as usize;
-                    if pes_header_len < payload.len() {
-                        audio_data.extend_from_slice(&payload[pes_header_len..]);
-                    }
-                    continue;
+            // Audio stream IDs: 0xC0-0xDF (MPEG audio), 0xBD (private/AAC)
+            if (stream_id >= 0xC0 && stream_id <= 0xDF) || stream_id == 0xBD {
+                if audio_pid.is_none() {
+                    audio_pid = Some(pid);
+                    debug!("HLS: found audio on PID {}", pid);
                 }
+
+                // Skip PES header to get to audio data
+                let pes_header_len = 9 + payload[8] as usize;
+                if pes_header_len < payload.len() {
+                    audio_data.extend_from_slice(&payload[pes_header_len..]);
+                }
+                continue;
             }
         }
 
@@ -725,6 +731,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_volume_constant_in_range() {
         assert!(VOLUME >= 0.0);
         assert!(VOLUME <= 1.0);

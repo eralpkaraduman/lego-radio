@@ -137,11 +137,7 @@ pub fn do_update() -> Result<()> {
 
 /// Compare semantic versions (returns true if a > b)
 fn version_greater(a: &str, b: &str) -> bool {
-    let parse = |v: &str| -> Vec<u32> {
-        v.split('.')
-            .filter_map(|s| s.parse().ok())
-            .collect()
-    };
+    let parse = |v: &str| -> Vec<u32> { v.split('.').filter_map(|s| s.parse().ok()).collect() };
 
     let va = parse(a);
     let vb = parse(b);
@@ -161,29 +157,66 @@ fn version_greater(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+
+    // =============================================================================
+    // Version Comparison Tests
+    // =============================================================================
 
     #[test]
-    fn test_version_compare() {
+    fn test_version_compare_patch() {
         assert!(version_greater("1.0.1", "1.0.0"));
-        assert!(version_greater("1.1.0", "1.0.0"));
-        assert!(version_greater("2.0.0", "1.9.9"));
-        assert!(version_greater("0.2.0", "0.1.0"));
         assert!(version_greater("0.1.1", "0.1.0"));
+        assert!(version_greater("0.0.2", "0.0.1"));
+    }
 
+    #[test]
+    fn test_version_compare_minor() {
+        assert!(version_greater("1.1.0", "1.0.0"));
+        assert!(version_greater("1.2.0", "1.1.9"));
+        assert!(version_greater("0.2.0", "0.1.0"));
+    }
+
+    #[test]
+    fn test_version_compare_major() {
+        assert!(version_greater("2.0.0", "1.9.9"));
+        assert!(version_greater("2.0.0", "1.0.0"));
+        assert!(version_greater("10.0.0", "9.9.9"));
+    }
+
+    #[test]
+    fn test_version_compare_equal() {
         assert!(!version_greater("1.0.0", "1.0.0"));
+        assert!(!version_greater("0.0.1", "0.0.1"));
+        assert!(!version_greater("99.99.99", "99.99.99"));
+    }
+
+    #[test]
+    fn test_version_compare_older() {
         assert!(!version_greater("1.0.0", "1.0.1"));
         assert!(!version_greater("0.9.9", "1.0.0"));
+        assert!(!version_greater("1.0.0", "2.0.0"));
     }
 
     #[test]
     fn test_version_compare_different_lengths() {
         assert!(version_greater("1.0.1", "1.0"));
         assert!(!version_greater("1.0", "1.0.1"));
+        assert!(version_greater("1.0.0.1", "1.0.0"));
     }
 
     #[test]
+    fn test_version_compare_with_leading_zeros() {
+        // Parser handles leading zeros gracefully
+        assert!(!version_greater("1.0.0", "1.00.00"));
+    }
+
+    // =============================================================================
+    // Binary Name Selection Tests
+    // =============================================================================
+
+    #[test]
     fn test_binary_name_selection() {
-        // Test that we handle all expected platforms
         let platforms = [
             (("linux", "aarch64"), "lego-radio-arm64"),
             (("linux", "x86_64"), "lego-radio-x86_64"),
@@ -201,5 +234,199 @@ mod tests {
             };
             assert_eq!(binary_name, expected);
         }
+    }
+
+    #[test]
+    fn test_current_platform_supported() {
+        let os = std::env::consts::OS;
+        let arch = std::env::consts::ARCH;
+
+        let supported = matches!(
+            (os, arch),
+            ("linux", "aarch64") | ("linux", "x86_64") | ("macos", "aarch64") | ("macos", "x86_64")
+        );
+
+        assert!(
+            supported,
+            "Current platform {}-{} should be supported",
+            os, arch
+        );
+    }
+
+    // =============================================================================
+    // File Operation Tests (using temp directories)
+    // =============================================================================
+
+    #[test]
+    fn test_cross_filesystem_copy() {
+        // Simulate the update flow with temp files
+        let temp_dir = std::env::temp_dir();
+        let source = temp_dir.join("test_source_binary");
+        let dest = temp_dir.join("test_dest_binary");
+
+        // Create source file with some content
+        fs::write(&source, b"test binary content").unwrap();
+
+        // Copy (not rename) to handle cross-filesystem
+        fs::copy(&source, &dest).unwrap();
+
+        // Verify content matches
+        let mut source_content = Vec::new();
+        let mut dest_content = Vec::new();
+        fs::File::open(&source)
+            .unwrap()
+            .read_to_end(&mut source_content)
+            .unwrap();
+        fs::File::open(&dest)
+            .unwrap()
+            .read_to_end(&mut dest_content)
+            .unwrap();
+
+        assert_eq!(source_content, dest_content);
+
+        // Cleanup
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn test_backup_and_restore_flow() {
+        let temp_dir = std::env::temp_dir();
+        let binary_path = temp_dir.join("test_binary");
+        let backup_path = temp_dir.join("test_binary.backup");
+        let new_binary = temp_dir.join("test_new_binary");
+
+        // Create "current" binary
+        fs::write(&binary_path, b"old version").unwrap();
+
+        // Create "new" binary
+        fs::write(&new_binary, b"new version").unwrap();
+
+        // Simulate update flow
+        let _ = fs::remove_file(&backup_path);
+        fs::rename(&binary_path, &backup_path).unwrap();
+        fs::copy(&new_binary, &binary_path).unwrap();
+
+        // Verify new content
+        let content = fs::read_to_string(&binary_path).unwrap();
+        assert_eq!(content, "new version");
+
+        // Verify backup exists
+        let backup_content = fs::read_to_string(&backup_path).unwrap();
+        assert_eq!(backup_content, "old version");
+
+        // Cleanup
+        let _ = fs::remove_file(&binary_path);
+        let _ = fs::remove_file(&backup_path);
+        let _ = fs::remove_file(&new_binary);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_executable_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = std::env::temp_dir();
+        let binary_path = temp_dir.join("test_executable");
+
+        // Create file
+        fs::write(&binary_path, b"#!/bin/bash\necho test").unwrap();
+
+        // Set executable permissions
+        let mut perms = fs::metadata(&binary_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&binary_path, perms).unwrap();
+
+        // Verify permissions
+        let perms = fs::metadata(&binary_path).unwrap().permissions();
+        assert_eq!(perms.mode() & 0o777, 0o755);
+
+        // Cleanup
+        let _ = fs::remove_file(&binary_path);
+    }
+
+    // =============================================================================
+    // GitHub API Response Tests
+    // =============================================================================
+
+    #[test]
+    fn test_github_release_deserialization() {
+        let json = r#"{"tag_name": "v1.2.3"}"#;
+        let release: GitHubRelease = serde_json::from_str(json).unwrap();
+        assert_eq!(release.tag_name, "v1.2.3");
+    }
+
+    #[test]
+    fn test_github_release_tag_parsing() {
+        let json = r#"{"tag_name": "v1.2.3"}"#;
+        let release: GitHubRelease = serde_json::from_str(json).unwrap();
+        let version = release.tag_name.trim_start_matches('v');
+        assert_eq!(version, "1.2.3");
+    }
+
+    #[test]
+    fn test_github_release_without_v_prefix() {
+        let json = r#"{"tag_name": "1.2.3"}"#;
+        let release: GitHubRelease = serde_json::from_str(json).unwrap();
+        let version = release.tag_name.trim_start_matches('v');
+        assert_eq!(version, "1.2.3");
+    }
+
+    // =============================================================================
+    // URL Construction Tests
+    // =============================================================================
+
+    #[test]
+    fn test_github_api_url() {
+        let url = format!(
+            "https://api.github.com/repos/{}/releases/latest",
+            GITHUB_REPO
+        );
+        assert_eq!(
+            url,
+            "https://api.github.com/repos/eralpkaraduman/lego-radio/releases/latest"
+        );
+    }
+
+    #[test]
+    fn test_download_url_construction() {
+        let binary_name = "lego-radio-arm64";
+        let url = format!(
+            "https://github.com/{}/releases/latest/download/{}",
+            GITHUB_REPO, binary_name
+        );
+        assert_eq!(
+            url,
+            "https://github.com/eralpkaraduman/lego-radio/releases/latest/download/lego-radio-arm64"
+        );
+    }
+
+    // =============================================================================
+    // Constants Tests
+    // =============================================================================
+
+    #[test]
+    fn test_version_constant_valid() {
+        // VERSION should be a valid semver
+        let parts: Vec<&str> = VERSION.split('.').collect();
+        assert!(parts.len() >= 2, "Version should have at least major.minor");
+
+        for part in parts {
+            assert!(
+                part.parse::<u32>().is_ok(),
+                "Version part '{}' should be numeric",
+                part
+            );
+        }
+    }
+
+    #[test]
+    fn test_github_repo_format() {
+        assert!(
+            GITHUB_REPO.contains('/'),
+            "GITHUB_REPO should be in 'owner/repo' format"
+        );
+        let parts: Vec<&str> = GITHUB_REPO.split('/').collect();
+        assert_eq!(parts.len(), 2, "GITHUB_REPO should have exactly one '/'");
     }
 }
