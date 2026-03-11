@@ -31,7 +31,14 @@ env_logger = "0.11"
 anyhow = "1"
 
 # Crash reporting, logging, metrics
-sentry = { version = "0.47", features = ["anyhow"] }
+sentry = { version = "0.47", default-features = false, features = [
+    "backtrace",
+    "contexts",
+    "panic",
+    "anyhow",
+    "reqwest",
+    "rustls",
+] }
 
 # Terminal input (for testing without GPIO)
 crossterm = "0.28"
