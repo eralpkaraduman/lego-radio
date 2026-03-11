@@ -1,6 +1,6 @@
 [package]
 name = "lego-radio"
-version = "0.4.5"
+version = "0.5.0"
 edition = "2021"
 description = "A LEGO-based internet radio with single button control"
 license = "MIT"
@@ -29,6 +29,9 @@ env_logger = "0.11"
 
 # Error handling
 anyhow = "1"
+
+# Crash reporting, logging, metrics
+sentry = { version = "0.47", features = ["anyhow"] }
 
 # Terminal input (for testing without GPIO)
 crossterm = "0.28"

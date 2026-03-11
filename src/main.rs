@@ -10,6 +10,9 @@ use std::sync::mpsc::Receiver;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Sentry DSN for crash reporting and metrics
+const SENTRY_DSN: &str = "https://a619cb8b77fe8255cce8eaab57f58108@o4511026110136320.ingest.de.sentry.io/4511027998228560";
+
 /// Radio state machine - explicit states instead of magic index numbers
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum RadioState {
@@ -31,8 +34,24 @@ impl RadioState {
 }
 
 fn main() -> Result<()> {
+    // Initialize Sentry for crash reporting (must be before logger)
+    let _sentry_guard = sentry::init((
+        SENTRY_DSN,
+        sentry::ClientOptions {
+            release: sentry::release_name!(),
+            send_default_pii: true,
+            ..Default::default()
+        },
+    ));
+
     // Initialize logger
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // Set device context
+    sentry::configure_scope(|scope| {
+        scope.set_tag("platform", std::env::consts::OS);
+        scope.set_tag("arch", std::env::consts::ARCH);
+    });
 
     // Parse CLI arguments
     let args: Vec<String> = std::env::args().collect();
@@ -106,6 +125,13 @@ Channels cycle: Welcome → 1 → 2 → ... → N → OFF → Welcome
 fn run_radio() -> Result<()> {
     info!("lego-radio v{} starting", VERSION);
 
+    sentry::add_breadcrumb(sentry::Breadcrumb {
+        category: Some("lifecycle".into()),
+        message: Some(format!("lego-radio v{} starting", VERSION)),
+        level: sentry::Level::Info,
+        ..Default::default()
+    });
+
     // Initialize TTS (downloads piper and voice model if needed)
     info!("Initializing TTS...");
     let tts = tts::PiperTts::new()?;
@@ -161,6 +187,14 @@ fn run_radio() -> Result<()> {
 
         info!("State: {:?}", state);
 
+        // Add breadcrumb for state transition
+        sentry::add_breadcrumb(sentry::Breadcrumb {
+            category: Some("state".into()),
+            message: Some(format!("State: {:?}", state)),
+            level: sentry::Level::Info,
+            ..Default::default()
+        });
+
         match state {
             RadioState::Welcome => {
                 handle_welcome(&mut pipeline, &tts);
@@ -207,6 +241,13 @@ fn play_channel(
     let channel = &channels::CHANNELS[idx];
     info!("Channel {}: {}", idx + 1, channel.name);
 
+    sentry::add_breadcrumb(sentry::Breadcrumb {
+        category: Some("playback".into()),
+        message: Some(format!("Playing channel {}: {}", idx + 1, channel.name)),
+        level: sentry::Level::Info,
+        ..Default::default()
+    });
+
     // Announce channel name (interruptible)
     if !pipeline.announce_interruptible(channel.tts_name, tts, Some(rx)) {
         info!("Interrupted during channel name");
@@ -243,6 +284,12 @@ fn play_channel(
                 // Check if stream is still active
                 if !pipeline.is_stream_active() {
                     warn!("Stream disconnected, will reconnect");
+                    sentry::add_breadcrumb(sentry::Breadcrumb {
+                        category: Some("connection".into()),
+                        message: Some(format!("Stream disconnected: {}", channel.name)),
+                        level: sentry::Level::Warning,
+                        ..Default::default()
+                    });
                     break; // Exit monitor loop, will reconnect
                 }
 
@@ -312,16 +359,29 @@ fn handle_welcome(pipeline: &mut audio::AudioPipeline, tts: &tts::PiperTts) {
     match updater::check_for_update() {
         Some(version) => {
             info!("Update available: v{}", version);
+
+            sentry::add_breadcrumb(sentry::Breadcrumb {
+                category: Some("update".into()),
+                message: Some(format!("Update available: v{}", version)),
+                level: sentry::Level::Info,
+                ..Default::default()
+            });
+
             pipeline.announce("Update found. Installing.", tts);
 
             match updater::do_update_to(Some(&version)) {
                 Ok(()) => {
+                    sentry::capture_message(
+                        &format!("Update successful: v{} -> v{}", VERSION, version),
+                        sentry::Level::Info,
+                    );
                     pipeline.announce("Update complete. Restarting.", tts);
                     std::thread::sleep(std::time::Duration::from_secs(2));
                     std::process::exit(0);
                 }
                 Err(e) => {
                     error!("Update failed: {}", e);
+                    sentry::integrations::anyhow::capture_anyhow(&e);
                     pipeline.announce("Update failed.", tts);
                 }
             }
