@@ -1,12 +1,15 @@
 mod audio;
 mod button;
 mod channels;
+mod metrics;
 mod tts;
 mod updater;
 
 use anyhow::Result;
 use log::{error, info, warn};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Receiver;
+use std::sync::Arc;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -135,9 +138,19 @@ fn run_radio() -> Result<()> {
     // Initialize TTS (downloads piper and voice model if needed)
     info!("Initializing TTS...");
     let tts = tts::PiperTts::new()?;
+    sentry::add_breadcrumb(sentry::Breadcrumb {
+        category: Some("init".into()),
+        message: Some("TTS initialized".into()),
+        level: sentry::Level::Info,
+        ..Default::default()
+    });
 
     // Simple audio pipeline (connect on demand)
     let mut pipeline = audio::AudioPipeline::new()?;
+
+    // Start metrics collection thread
+    let metrics_stop = Arc::new(AtomicBool::new(false));
+    metrics::start_metrics_thread(metrics_stop.clone());
 
     // Channel for button events (input thread -> main thread)
     let (tx, rx) = std::sync::mpsc::channel::<()>();
@@ -173,6 +186,14 @@ fn run_radio() -> Result<()> {
 
             // Drain any extra queued button presses (rapid pressing)
             while rx.try_recv().is_ok() {}
+
+            // Track button press
+            sentry::add_breadcrumb(sentry::Breadcrumb {
+                category: Some("input".into()),
+                message: Some("Button pressed".into()),
+                level: sentry::Level::Info,
+                ..Default::default()
+            });
 
             // Stop everything and clear buffer immediately
             pipeline.stop();
@@ -300,6 +321,15 @@ fn play_channel(
             retry_count += 1;
 
             if retry_count > RECONNECT_SILENT_RETRIES {
+                // Send Sentry event for persistent connection issues
+                sentry::capture_message(
+                    &format!(
+                        "Stream reconnection required: {} (attempt {})",
+                        channel.name, retry_count
+                    ),
+                    sentry::Level::Warning,
+                );
+
                 // Announce only after silent retries exhausted
                 if !pipeline.announce_interruptible("Connection lost. Reconnecting.", tts, Some(rx))
                 {
@@ -317,6 +347,15 @@ fn play_channel(
             retry_count += 1;
 
             if retry_count > RECONNECT_SILENT_RETRIES {
+                // Send Sentry event for connection failures
+                sentry::capture_message(
+                    &format!(
+                        "Stream connection failed: {} (attempt {})",
+                        channel.name, retry_count
+                    ),
+                    sentry::Level::Warning,
+                );
+
                 error!(
                     "Connection failed for {} (attempt {})",
                     channel.name, retry_count

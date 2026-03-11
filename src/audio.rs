@@ -73,6 +73,14 @@ impl AudioPipeline {
         );
         sink.set_volume(VOLUME);
 
+        info!("Audio pipeline initialized");
+        sentry::add_breadcrumb(sentry::Breadcrumb {
+            category: Some("audio".into()),
+            message: Some("Audio pipeline initialized".into()),
+            level: sentry::Level::Info,
+            ..Default::default()
+        });
+
         Ok(Self {
             sink,
             stream_thread: None,
@@ -112,13 +120,14 @@ impl AudioPipeline {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_clone = stop_flag.clone();
         let sink = self.sink.clone();
-        let url = url.to_string();
+        let url_string = url.to_string();
+        let url_for_thread = url_string.clone();
 
         // Channel to signal when connected
         let (connected_tx, connected_rx) = std::sync::mpsc::channel();
 
         let thread = thread::spawn(move || {
-            stream_loop(&url, sink, stop_clone, connected_tx);
+            stream_loop(&url_for_thread, sink, stop_clone, connected_tx);
         });
 
         self.stream_thread = Some(StreamHandle { thread, stop_flag });
@@ -127,15 +136,33 @@ impl AudioPipeline {
         match connected_rx.recv_timeout(Duration::from_secs(10)) {
             Ok(true) => {
                 info!("Connected and playing");
+                sentry::add_breadcrumb(sentry::Breadcrumb {
+                    category: Some("stream".into()),
+                    message: Some(format!("Connected to stream: {}", url_string)),
+                    level: sentry::Level::Info,
+                    ..Default::default()
+                });
                 true
             }
             Ok(false) => {
                 warn!("Connection failed");
+                sentry::add_breadcrumb(sentry::Breadcrumb {
+                    category: Some("stream".into()),
+                    message: Some(format!("Connection failed: {}", url_string)),
+                    level: sentry::Level::Warning,
+                    ..Default::default()
+                });
                 self.stop();
                 false
             }
             Err(_) => {
                 warn!("Connection timed out");
+                sentry::add_breadcrumb(sentry::Breadcrumb {
+                    category: Some("stream".into()),
+                    message: Some(format!("Connection timeout: {}", url_string)),
+                    level: sentry::Level::Warning,
+                    ..Default::default()
+                });
                 self.stop();
                 false
             }
