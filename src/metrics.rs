@@ -112,21 +112,11 @@ pub fn start_metrics_thread(stop_flag: Arc<AtomicBool>) {
             METRICS_INTERVAL_SECS
         );
 
-        // Store previous CPU stats for delta calculation
-        #[cfg(target_os = "linux")]
-        let mut prev_cpu_stats: Option<(u64, u64)> = None;
-
         loop {
             // Check if we should stop
             if stop_flag.load(Ordering::SeqCst) {
                 info!("Metrics collection stopped");
                 break;
-            }
-
-            // Update CPU stats for next iteration (Linux only)
-            #[cfg(target_os = "linux")]
-            {
-                prev_cpu_stats = read_cpu_stats_raw();
             }
 
             // Sleep for the interval, checking stop flag periodically
@@ -156,10 +146,6 @@ pub fn start_metrics_thread(stop_flag: Arc<AtomicBool>) {
                     ..Default::default()
                 });
             }
-
-            // Suppress unused variable warning on non-Linux
-            #[cfg(target_os = "linux")]
-            let _ = prev_cpu_stats;
         }
     });
 }
