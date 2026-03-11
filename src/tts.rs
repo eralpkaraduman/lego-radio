@@ -373,8 +373,18 @@ impl PiperTts {
 }
 
 fn get_data_dir() -> Result<PathBuf> {
-    let home = std::env::var("HOME").map_err(|_| anyhow!("HOME not set"))?;
-    Ok(PathBuf::from(home).join(".local/share/lego-radio"))
+    // Try HOME first, fall back to /var/lib for systemd services
+    if let Ok(home) = std::env::var("HOME") {
+        return Ok(PathBuf::from(home).join(".local/share/lego-radio"));
+    }
+
+    // Fallback for systemd services running as root without HOME
+    let fallback = PathBuf::from("/var/lib/lego-radio");
+    if fallback.exists() || std::fs::create_dir_all(&fallback).is_ok() {
+        return Ok(fallback);
+    }
+
+    Err(anyhow!("Cannot determine data directory: HOME not set and /var/lib/lego-radio not writable"))
 }
 
 #[cfg(not(target_os = "macos"))]

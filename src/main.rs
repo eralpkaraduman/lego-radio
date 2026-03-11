@@ -62,6 +62,12 @@ fn main() -> Result<()> {
             let url = args.get(2).map(|s| s.as_str()).unwrap_or(channels::CHANNELS[0].url);
             return test_stream(url);
         }
+        Some("--set-volume") => {
+            let volume = args.get(2)
+                .and_then(|s| s.parse::<u8>().ok())
+                .unwrap_or(80);
+            return set_system_volume(volume);
+        }
         _ => {}
     }
 
@@ -77,13 +83,14 @@ USAGE:
     lego-radio [OPTION]
 
 OPTIONS:
-    --version, -v     Print version
-    --help, -h        Print this help
-    --install         Install as systemd service
-    --uninstall       Remove systemd service
-    --update          Download and install latest version
-    --test-tts        Test text-to-speech
-    --test-stream     Test audio streaming [URL]
+    --version, -v       Print version
+    --help, -h          Print this help
+    --install           Install as systemd service
+    --uninstall         Remove systemd service
+    --update            Download and install latest version
+    --set-volume <0-100> Set system audio volume (ALSA)
+    --test-tts          Test text-to-speech
+    --test-stream [URL] Test audio streaming
 
 CONTROLS:
     On Raspberry Pi: Channel switch (GPIO) cycles stations
@@ -180,11 +187,13 @@ fn run_radio() -> Result<()> {
     }
 }
 
-/// Retry interval for failed connections (seconds)
-const RECONNECT_INTERVAL_SECS: u64 = 30;
-
 /// How often to check stream status (milliseconds)
 const STREAM_CHECK_INTERVAL_MS: u64 = 500;
+
+/// Reconnection strategy with exponential backoff
+const RECONNECT_INITIAL_SECS: u64 = 2;    // Start with 2 second retry
+const RECONNECT_MAX_SECS: u64 = 60;       // Cap at 60 seconds
+const RECONNECT_SILENT_RETRIES: u32 = 3;  // Silent retries before announcing
 
 /// Play a channel with interrupt support and auto-reconnect
 /// Returns false if interrupted (caller should continue loop)
@@ -209,11 +218,18 @@ fn play_channel(
         return false;
     }
 
-    // Main playback loop with auto-reconnect
+    // Main playback loop with auto-reconnect and exponential backoff
+    let mut retry_count: u32 = 0;
+    let mut retry_interval = RECONNECT_INITIAL_SECS;
+
     loop {
         // Try to connect
         if pipeline.connect_and_play(channel.url) {
             info!("Stream connected, monitoring playback");
+
+            // Reset retry state on successful connection
+            retry_count = 0;
+            retry_interval = RECONNECT_INITIAL_SECS;
 
             // Monitor stream - check for button press or stream disconnect
             loop {
@@ -232,24 +248,37 @@ fn play_channel(
                 std::thread::sleep(std::time::Duration::from_millis(STREAM_CHECK_INTERVAL_MS));
             }
 
-            // Stream disconnected - announce and reconnect
-            if !pipeline.announce_interruptible("Connection lost. Reconnecting.", tts, Some(rx)) {
-                info!("Interrupted during reconnect announcement");
-                return false;
+            // Stream disconnected - silent retry first
+            retry_count += 1;
+
+            if retry_count > RECONNECT_SILENT_RETRIES {
+                // Announce only after silent retries exhausted
+                if !pipeline.announce_interruptible("Connection lost. Reconnecting.", tts, Some(rx)) {
+                    info!("Interrupted during reconnect announcement");
+                    return false;
+                }
+            } else {
+                info!("Silent reconnect attempt {} of {}", retry_count, RECONNECT_SILENT_RETRIES);
             }
         } else {
-            // Initial connection failed
-            error!("Connection failed for {}", channel.name);
-            if !pipeline.announce_interruptible("Connection failed. Retrying.", tts, Some(rx)) {
-                info!("Interrupted during retry announcement");
-                return false;
+            // Connection failed
+            retry_count += 1;
+
+            if retry_count > RECONNECT_SILENT_RETRIES {
+                error!("Connection failed for {} (attempt {})", channel.name, retry_count);
+                if !pipeline.announce_interruptible("Connection failed. Retrying.", tts, Some(rx)) {
+                    info!("Interrupted during retry announcement");
+                    return false;
+                }
+            } else {
+                info!("Silent retry {} of {} for {}", retry_count, RECONNECT_SILENT_RETRIES, channel.name);
             }
         }
 
-        // Wait before retry, checking for interrupts
-        info!("Waiting {}s before reconnect attempt", RECONNECT_INTERVAL_SECS);
+        // Wait before retry with exponential backoff, checking for interrupts
+        info!("Waiting {}s before reconnect attempt", retry_interval);
         let wait_until = std::time::Instant::now()
-            + std::time::Duration::from_secs(RECONNECT_INTERVAL_SECS);
+            + std::time::Duration::from_secs(retry_interval);
 
         while std::time::Instant::now() < wait_until {
             if rx.try_recv().is_ok() {
@@ -259,11 +288,8 @@ fn play_channel(
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
 
-        // Announce retry attempt
-        if !pipeline.announce_interruptible("Reconnecting", tts, Some(rx)) {
-            info!("Interrupted during reconnecting announcement");
-            return false;
-        }
+        // Exponential backoff: double the interval, cap at max
+        retry_interval = (retry_interval * 2).min(RECONNECT_MAX_SECS);
     }
 }
 
@@ -332,6 +358,61 @@ fn test_stream(url: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn set_system_volume(volume: u8) -> Result<()> {
+    let volume = volume.min(100);
+    println!("Setting system volume to {}%", volume);
+
+    #[cfg(target_os = "linux")]
+    {
+        // Try amixer (ALSA) first
+        let result = std::process::Command::new("amixer")
+            .args(["sset", "Master", &format!("{}%", volume)])
+            .output();
+
+        match result {
+            Ok(output) if output.status.success() => {
+                println!("Volume set successfully (ALSA Master)");
+                return Ok(());
+            }
+            _ => {
+                // Try Digital control for HiFiBerry DAC
+                let result = std::process::Command::new("amixer")
+                    .args(["sset", "Digital", &format!("{}%", volume)])
+                    .output();
+
+                match result {
+                    Ok(output) if output.status.success() => {
+                        println!("Volume set successfully (ALSA Digital)");
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Try pactl (PipeWire/PulseAudio)
+        let result = std::process::Command::new("pactl")
+            .args(["set-sink-volume", "@DEFAULT_SINK@", &format!("{}%", volume)])
+            .output();
+
+        match result {
+            Ok(output) if output.status.success() => {
+                println!("Volume set successfully (PipeWire/PulseAudio)");
+                return Ok(());
+            }
+            _ => {
+                return Err(anyhow::anyhow!("Failed to set volume. No working audio control found."));
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        println!("Volume control only supported on Linux");
+        Ok(())
+    }
 }
 
 fn install_service() -> Result<()> {
