@@ -99,19 +99,29 @@ pub fn do_update_to(version: Option<&str>) -> Result<()> {
     info!("Replacing: {:?}", current_exe);
 
     // On some systems, we can't replace a running binary directly
-    // So we rename the old one first, then move the new one in place
+    // So we rename the old one first, then copy the new one in place
+    // (copy instead of rename to handle cross-filesystem updates)
     let backup_path = format!("{}.backup", current_exe.display());
 
     // Remove old backup if exists
     let _ = fs::remove_file(&backup_path);
 
-    // Rename current to backup
+    // Rename current to backup (same filesystem, should work)
     fs::rename(&current_exe, &backup_path)?;
 
-    // Move new binary to current location
-    fs::rename(tmp_path, &current_exe)?;
+    // Copy new binary to current location (handles cross-filesystem)
+    fs::copy(tmp_path, &current_exe)?;
 
-    // Remove backup
+    // Set executable permissions
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&current_exe)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&current_exe, perms)?;
+    }
+
+    // Clean up temp and backup files
+    let _ = fs::remove_file(tmp_path);
     let _ = fs::remove_file(&backup_path);
 
     info!("Updated to v{}!", latest);
