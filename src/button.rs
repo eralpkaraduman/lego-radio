@@ -218,25 +218,25 @@ impl<P: PinReader> GenericGpioButton<P> {
 
         loop {
             thread::sleep(poll);
+
+            // Check elapsed time first (cheaper than GPIO read)
+            let elapsed = press_start.elapsed();
             let level = self.pin.read();
 
-            // Check if long press threshold reached while still held
-            if press_start.elapsed() >= long_press_threshold && level == PinLevel::Low {
-                info!(
-                    "Button: Long press ({:.1}s) - triggering immediately",
-                    press_start.elapsed().as_secs_f32()
-                );
-                let _ = tx.send(ButtonEvent::Long);
+            // Check if released before threshold (most common case)
+            if level == PinLevel::High {
+                info!("Button: Short press ({:.1}s)", elapsed.as_secs_f32());
+                let _ = tx.send(ButtonEvent::Short);
                 return;
             }
 
-            // Check if released before threshold
-            if level == PinLevel::High {
+            // Check if long press threshold reached while still held
+            if elapsed >= long_press_threshold {
                 info!(
-                    "Button: Short press ({:.1}s)",
-                    press_start.elapsed().as_secs_f32()
+                    "Button: Long press ({:.1}s) - triggering immediately",
+                    elapsed.as_secs_f32()
                 );
-                let _ = tx.send(ButtonEvent::Short);
+                let _ = tx.send(ButtonEvent::Long);
                 return;
             }
         }

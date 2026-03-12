@@ -237,21 +237,40 @@ impl AudioPipeline {
         self.sink.play();
     }
 
-    /// Stop the continuous beep
+    /// Stop the continuous beep with a quick fade-out to avoid click
     pub fn stop_beep(&self) {
+        // Generate a very short fade-out tone to avoid audio pop
+        let sample_rate = 44100u32;
+        let fade_ms = 15; // 15ms fade-out
+        let frequency = 880.0f32;
+        let num_samples = (sample_rate as usize * fade_ms) / 1000;
+
+        let samples: Vec<f32> = (0..num_samples)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                let envelope = 1.0 - (i as f32 / num_samples as f32); // Linear fade out
+                (t * frequency * 2.0 * std::f32::consts::PI).sin() * BEEP_VOLUME * envelope
+            })
+            .collect();
+
+        // Clear and immediately play fade-out
         self.sink.clear();
+        let source = SamplesBuffer::new(1, sample_rate, samples);
+        self.sink.append(source);
+        self.sink.play();
+        self.sink.sleep_until_end();
     }
 
     /// Play TTS announcement
     ///
-    /// Plays TTS through the sink. Returns true if completed, false if interrupted.
+    /// Plays TTS through the sink. Returns None if completed, Some(event) if interrupted.
     /// Pass a receiver to check for interrupts, or None for blocking playback.
     pub fn announce_interruptible(
         &mut self,
         text: &str,
         tts: &crate::tts::PiperTts,
         interrupt_rx: Option<&std::sync::mpsc::Receiver<ButtonEvent>>,
-    ) -> bool {
+    ) -> Option<ButtonEvent> {
         info!("TTS: {}", text);
 
         // Synthesize
@@ -259,12 +278,12 @@ impl AudioPipeline {
             Ok(s) => s,
             Err(e) => {
                 warn!("TTS failed: {}", e);
-                return true;
+                return None;
             }
         };
 
         if samples.is_empty() {
-            return true;
+            return None;
         }
 
         let samples_f32: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
@@ -276,16 +295,16 @@ impl AudioPipeline {
         // Wait for playback, checking for interrupts
         while !self.sink.empty() {
             if let Some(rx) = interrupt_rx {
-                if rx.try_recv().is_ok() {
-                    info!("TTS interrupted");
+                if let Ok(event) = rx.try_recv() {
+                    info!("TTS interrupted by {:?}", event);
                     self.sink.clear();
-                    return false;
+                    return Some(event);
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
-        true
+        None
     }
 
     /// Play TTS announcement (blocking, no interrupt check)

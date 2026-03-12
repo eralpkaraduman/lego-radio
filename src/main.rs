@@ -349,22 +349,15 @@ fn play_channel(
     });
 
     // Announce channel name (interruptible)
-    if !pipeline.announce_interruptible(channel.tts_name, tts, Some(rx)) {
+    if let Some(event) = pipeline.announce_interruptible(channel.tts_name, tts, Some(rx)) {
         info!("Interrupted during channel name");
-        // Check what event interrupted us
-        if let Ok(event) = rx.try_recv() {
-            return Some(event);
-        }
-        return Some(ButtonEvent::Down); // Default to Down if we can't get the event
+        return Some(event);
     }
 
     // Announce connecting (interruptible)
-    if !pipeline.announce_interruptible("Connecting", tts, Some(rx)) {
+    if let Some(event) = pipeline.announce_interruptible("Connecting", tts, Some(rx)) {
         info!("Interrupted during connecting");
-        if let Ok(event) = rx.try_recv() {
-            return Some(event);
-        }
-        return Some(ButtonEvent::Down);
+        return Some(event);
     }
 
     // Main playback loop with auto-reconnect and exponential backoff
@@ -417,13 +410,11 @@ fn play_channel(
                 );
 
                 // Announce only after silent retries exhausted
-                if !pipeline.announce_interruptible("Connection lost. Reconnecting.", tts, Some(rx))
+                if let Some(event) =
+                    pipeline.announce_interruptible("Connection lost. Reconnecting.", tts, Some(rx))
                 {
                     info!("Interrupted during reconnect announcement");
-                    if let Ok(event) = rx.try_recv() {
-                        return Some(event);
-                    }
-                    return Some(ButtonEvent::Down);
+                    return Some(event);
                 }
             } else {
                 info!(
@@ -449,12 +440,11 @@ fn play_channel(
                     "Connection failed for {} (attempt {})",
                     channel.name, retry_count
                 );
-                if !pipeline.announce_interruptible("Connection failed. Retrying.", tts, Some(rx)) {
+                if let Some(event) =
+                    pipeline.announce_interruptible("Connection failed. Retrying.", tts, Some(rx))
+                {
                     info!("Interrupted during retry announcement");
-                    if let Ok(event) = rx.try_recv() {
-                        return Some(event);
-                    }
-                    return Some(ButtonEvent::Down);
+                    return Some(event);
                 }
             } else {
                 info!(
