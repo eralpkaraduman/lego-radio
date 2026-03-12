@@ -178,36 +178,6 @@ impl AudioPipeline {
         }
     }
 
-    /// Play a short confirmation beep (blocking - waits for beep to finish)
-    pub fn beep(&self) {
-        // Generate a 80ms 880Hz sine wave (A5 note)
-        let sample_rate = 44100u32;
-        let duration_ms = 80;
-        let frequency = 880.0f32;
-        let num_samples = (sample_rate as usize * duration_ms) / 1000;
-
-        let samples: Vec<f32> = (0..num_samples)
-            .map(|i| {
-                let t = i as f32 / sample_rate as f32;
-                let envelope = if i < num_samples / 10 {
-                    // Fade in
-                    i as f32 / (num_samples / 10) as f32
-                } else if i > num_samples * 9 / 10 {
-                    // Fade out
-                    (num_samples - i) as f32 / (num_samples / 10) as f32
-                } else {
-                    1.0
-                };
-                (t * frequency * 2.0 * std::f32::consts::PI).sin() * BEEP_VOLUME * envelope
-            })
-            .collect();
-
-        let source = SamplesBuffer::new(1, sample_rate, samples);
-        self.sink.append(source);
-        self.sink.play(); // Ensure not paused
-        self.sink.sleep_until_end(); // Wait for beep to play
-    }
-
     /// Start continuous beep (non-blocking) - plays until stop_beep is called
     /// Generates a long tone that will be cut off when stop_beep is called
     pub fn start_beep(&self) {
@@ -255,6 +225,56 @@ impl AudioPipeline {
 
         // Clear and immediately play fade-out
         self.sink.clear();
+        let source = SamplesBuffer::new(1, sample_rate, samples);
+        self.sink.append(source);
+        self.sink.play();
+        self.sink.sleep_until_end();
+    }
+
+    /// Play a short confirmation tune for channel change (ascending two-note chirp)
+    /// Blocking - waits for tune to finish
+    pub fn confirm_beep(&self) {
+        let sample_rate = 44100u32;
+        let note_ms = 60; // 60ms per note
+        let gap_ms = 20; // 20ms gap between notes
+        let freq1 = 880.0f32; // A5
+        let freq2 = 1108.73f32; // C#6 (major third up - happy sound)
+
+        let note_samples = (sample_rate as usize * note_ms) / 1000;
+        let gap_samples = (sample_rate as usize * gap_ms) / 1000;
+        let total_samples = note_samples * 2 + gap_samples;
+
+        let samples: Vec<f32> = (0..total_samples)
+            .map(|i| {
+                // Determine which part we're in
+                let (frequency, local_i, local_len) = if i < note_samples {
+                    // First note
+                    (freq1, i, note_samples)
+                } else if i < note_samples + gap_samples {
+                    // Gap (silence)
+                    return 0.0;
+                } else {
+                    // Second note
+                    (freq2, i - note_samples - gap_samples, note_samples)
+                };
+
+                let t = local_i as f32 / sample_rate as f32;
+
+                // Envelope with quick attack and decay
+                let envelope = if local_i < local_len / 8 {
+                    // Fast attack
+                    local_i as f32 / (local_len / 8) as f32
+                } else if local_i > local_len * 7 / 8 {
+                    // Fast decay
+                    (local_len - local_i) as f32 / (local_len / 8) as f32
+                } else {
+                    1.0
+                };
+
+                (t * frequency * 2.0 * std::f32::consts::PI).sin() * BEEP_VOLUME * envelope
+            })
+            .collect();
+
         let source = SamplesBuffer::new(1, sample_rate, samples);
         self.sink.append(source);
         self.sink.play();

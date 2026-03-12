@@ -234,10 +234,10 @@ fn run_radio() -> Result<()> {
             } else {
                 // Got Short or Long directly (shouldn't happen normally, but handle it)
                 pipeline.stop();
-                pipeline.beep();
                 if event == ButtonEvent::Long {
                     state = RadioState::Off;
                 } else {
+                    pipeline.confirm_beep();
                     state = state.next(num_channels);
                 }
             }
@@ -270,7 +270,10 @@ fn run_radio() -> Result<()> {
                         // Button just pressed - handle with continuous beep
                         handle_button_down(&mut pipeline, &rx)
                     } else {
-                        // Got Short or Long directly
+                        // Got Short or Long directly - play confirm for short
+                        if event == ButtonEvent::Short {
+                            pipeline.confirm_beep();
+                        }
                         event
                     };
 
@@ -326,6 +329,11 @@ fn handle_button_down(
 
     // Stop the beep
     pipeline.stop_beep();
+
+    // Play confirmation chirp for short press (channel change feedback)
+    if final_event == ButtonEvent::Short {
+        pipeline.confirm_beep();
+    }
 
     final_event
 }
