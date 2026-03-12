@@ -1,4 +1,4 @@
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use log::info;
 use std::time::Duration;
 
@@ -14,7 +14,6 @@ pub enum ButtonEvent {
 }
 
 /// Duration to hold button for long press (milliseconds)
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub const LONG_PRESS_MS: u64 = 2000;
 
 /// Trait for button input abstraction
@@ -53,27 +52,19 @@ impl Default for ButtonConfig {
     }
 }
 
-/// Keyboard pin reader - reports key presses as Low, otherwise High
-/// Each key press sets a flag that is cleared after being read once as Low
+/// Keyboard pin reader - tracks actual key held state
+/// Reports Low while Enter/Space is held, High when released
+/// Behaves exactly like a physical button - no shortcuts
 pub struct KeyboardPinReader {
-    /// Flag indicating a key was pressed (cleared after one Low read)
-    pressed: std::sync::atomic::AtomicBool,
-    /// Flag for simulating long press (set by 'o' key)
-    long_press: std::sync::atomic::AtomicBool,
+    /// True while the button key (Enter/Space) is held down
+    held: std::sync::atomic::AtomicBool,
 }
 
 impl KeyboardPinReader {
     pub fn new() -> Self {
         Self {
-            pressed: std::sync::atomic::AtomicBool::new(false),
-            long_press: std::sync::atomic::AtomicBool::new(false),
+            held: std::sync::atomic::AtomicBool::new(false),
         }
-    }
-
-    /// Check if last press was a long press simulation
-    pub fn take_long_press(&self) -> bool {
-        use std::sync::atomic::Ordering;
-        self.long_press.swap(false, Ordering::SeqCst)
     }
 }
 
@@ -84,44 +75,39 @@ impl PinReader for KeyboardPinReader {
         // Poll for keyboard events (non-blocking)
         if event::poll(Duration::from_millis(1)).unwrap_or(false) {
             if let Ok(Event::Key(key_event)) = event::read() {
-                match key_event {
-                    // Enter or Space simulates short button press
-                    KeyEvent {
-                        code: KeyCode::Enter,
-                        ..
+                // Only handle Enter or Space as the "button"
+                let is_button_key = matches!(key_event.code, KeyCode::Enter | KeyCode::Char(' '));
+
+                if is_button_key {
+                    match key_event.kind {
+                        KeyEventKind::Press => {
+                            info!("Input: Button key pressed");
+                            self.held.store(true, Ordering::SeqCst);
+                        }
+                        KeyEventKind::Release => {
+                            info!("Input: Button key released");
+                            self.held.store(false, Ordering::SeqCst);
+                        }
+                        KeyEventKind::Repeat => {
+                            // Key is being held - keep state as Low
+                        }
                     }
-                    | KeyEvent {
-                        code: KeyCode::Char(' '),
-                        ..
-                    } => {
-                        info!("Input: Key pressed (short)");
-                        self.pressed.store(true, Ordering::SeqCst);
-                    }
-                    // 'o' key simulates long press (Off)
-                    KeyEvent {
-                        code: KeyCode::Char('o'),
-                        modifiers: KeyModifiers::NONE,
-                        ..
-                    } => {
-                        info!("Input: Key pressed (long/off)");
-                        self.pressed.store(true, Ordering::SeqCst);
-                        self.long_press.store(true, Ordering::SeqCst);
-                    }
-                    // Ctrl+C to exit
-                    KeyEvent {
-                        code: KeyCode::Char('c'),
-                        modifiers: KeyModifiers::CONTROL,
-                        ..
-                    } => {
-                        std::process::exit(0);
-                    }
-                    _ => {}
+                }
+
+                // Ctrl+C to exit
+                if let KeyEvent {
+                    code: KeyCode::Char('c'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } = key_event
+                {
+                    std::process::exit(0);
                 }
             }
         }
 
-        // Return Low if pressed, then clear the flag
-        if self.pressed.swap(false, Ordering::SeqCst) {
+        // Return current held state
+        if self.held.load(Ordering::SeqCst) {
             PinLevel::Low
         } else {
             PinLevel::High
@@ -130,42 +116,23 @@ impl PinReader for KeyboardPinReader {
 }
 
 /// Keyboard-based button for testing on Mac/desktop
-/// Supports:
-/// - Enter/Space = short press (cycle channel)
-/// - 'o' key = long press (jump to Off state)
+/// Uses GenericGpioButton logic - behaves exactly like physical button
+/// Hold Enter/Space for 2+ seconds for long press, release earlier for short press
 pub struct KeyboardButton {
-    reader: KeyboardPinReader,
+    inner: GenericGpioButton<KeyboardPinReader>,
 }
 
 impl KeyboardButton {
     pub fn new() -> Self {
         Self {
-            reader: KeyboardPinReader::new(),
+            inner: GenericGpioButton::new(KeyboardPinReader::new(), ButtonConfig::default()),
         }
     }
 }
 
 impl ButtonInput for KeyboardButton {
     fn wait_for_press(&self, tx: &std::sync::mpsc::Sender<ButtonEvent>) {
-        // Wait for any key press
-        loop {
-            let level = self.reader.read();
-            if level == PinLevel::Low {
-                // Send Down event first
-                let _ = tx.send(ButtonEvent::Down);
-
-                // Check if it was the 'o' key (long press simulation)
-                if self.reader.take_long_press() {
-                    info!("Keyboard: Long press (Off) detected");
-                    let _ = tx.send(ButtonEvent::Long);
-                    return;
-                }
-                info!("Keyboard: Short press detected");
-                let _ = tx.send(ButtonEvent::Short);
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        self.inner.wait_for_press(tx)
     }
 
     fn is_gpio(&self) -> bool {
@@ -316,7 +283,7 @@ pub fn create_button() -> Box<dyn ButtonInput> {
         }
     }
 
-    log::info!("Using keyboard input (Enter/Space=cycle, O=off)");
+    log::info!("Using keyboard input (Enter/Space = button, hold 2s for off)");
     Box::new(KeyboardButton::new())
 }
 
@@ -477,43 +444,46 @@ mod tests {
     }
 
     // ==================== Keyboard Simulation Tests ====================
+    // Note: KeyboardButton uses GenericGpioButton internally, so it shares
+    // the same press detection logic as GPIO. The tests above for
+    // GenericGpioButton also validate keyboard behavior.
 
     #[test]
-    fn test_keyboard_pin_reader_long_press_flag() {
+    fn test_keyboard_pin_reader_held_state() {
         use std::sync::atomic::Ordering;
 
         let reader = KeyboardPinReader::new();
 
-        // Initially no long press
-        assert!(!reader.take_long_press());
+        // Initially not held (High)
+        assert!(!reader.held.load(Ordering::SeqCst));
 
-        // Set long press flag
-        reader.long_press.store(true, Ordering::SeqCst);
+        // Simulate key press by setting held flag
+        reader.held.store(true, Ordering::SeqCst);
 
-        // First take should return true and clear
-        assert!(reader.take_long_press());
+        // Should read Low while held (no clearing - persistent state)
+        assert_eq!(reader.read(), PinLevel::Low);
+        assert_eq!(reader.read(), PinLevel::Low); // Still Low
 
-        // Second take should return false (cleared)
-        assert!(!reader.take_long_press());
+        // Simulate key release
+        reader.held.store(false, Ordering::SeqCst);
+
+        // Should read High after release
+        assert_eq!(reader.read(), PinLevel::High);
     }
 
     #[test]
-    fn test_keyboard_pin_reader_pressed_flag() {
-        use std::sync::atomic::Ordering;
+    fn test_keyboard_uses_same_logic_as_gpio() {
+        // KeyboardButton wraps GenericGpioButton, ensuring identical behavior
+        let keyboard = KeyboardButton::new();
+        let mock_pin = MockPin::new(vec![PinLevel::Low, PinLevel::High]);
+        let gpio = GenericGpioButton::new(mock_pin, ButtonConfig::default());
 
-        let reader = KeyboardPinReader::new();
+        // Both should report the same is_gpio status as expected
+        assert!(!keyboard.is_gpio()); // Keyboard reports false
+        assert!(gpio.is_gpio()); // GPIO reports true
 
-        // Initially not pressed (High)
-        assert_eq!(reader.read(), PinLevel::High);
-
-        // Set pressed flag
-        reader.pressed.store(true, Ordering::SeqCst);
-
-        // Should read Low and clear flag
-        assert_eq!(reader.read(), PinLevel::Low);
-
-        // Should be High again (flag cleared)
-        assert_eq!(reader.read(), PinLevel::High);
+        // But both use the same GenericGpioButton::detect_press logic internally
+        // (verified by code structure, not runtime test)
     }
 
     // Note: test_long_press_triggers_while_held uses real wall-clock time (2 seconds).

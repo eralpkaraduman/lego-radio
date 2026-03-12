@@ -121,7 +121,7 @@ CONTROLS:
     Long press (2s): Jump to OFF state
 
     On Raspberry Pi: GPIO button on pin 17
-    On Mac/Desktop:  Enter/Space=cycle, O=off
+    On Mac/Desktop:  Enter/Space (works like physical button)
 
 Channels cycle: Welcome → 1 → 2 → ... → N → OFF → Welcome
 "#,
@@ -163,7 +163,7 @@ fn run_radio() -> Result<()> {
     std::thread::spawn(move || {
         let button = button::create_button();
         if !button.is_gpio() {
-            info!("(Enter/Space=cycle, O=off)");
+            info!("(Enter/Space = button, hold 2s for off)");
         }
         loop {
             button.wait_for_press(&tx);
