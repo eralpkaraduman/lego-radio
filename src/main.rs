@@ -6,7 +6,7 @@ mod tts;
 mod updater;
 
 use anyhow::Result;
-use button::PressType;
+use button::ButtonEvent;
 use log::{error, info, warn};
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Receiver;
@@ -157,7 +157,7 @@ fn run_radio() -> Result<()> {
     metrics::start_metrics_thread(metrics_stop.clone());
 
     // Channel for button events (input thread -> main thread)
-    let (tx, rx) = std::sync::mpsc::channel::<PressType>();
+    let (tx, rx) = std::sync::mpsc::channel::<button::ButtonEvent>();
 
     // Button input in background thread
     std::thread::spawn(move || {
@@ -166,8 +166,7 @@ fn run_radio() -> Result<()> {
             info!("(Enter/Space=cycle, O=off)");
         }
         loop {
-            let press_type = button.wait_for_press();
-            let _ = tx.send(press_type);
+            button.wait_for_press(&tx);
         }
     });
 
@@ -183,44 +182,64 @@ fn run_radio() -> Result<()> {
 
     let mut skip_wait = false; // Skip waiting for button press (after interrupt)
 
+    // Debounce tracking
+    let mut last_press_time = std::time::Instant::now() - std::time::Duration::from_secs(10);
+
     loop {
         if !skip_wait {
-            // Wait for button press
-            let press_type = rx.recv().unwrap_or(PressType::Short);
+            // Wait for button down event
+            let event = rx.recv().unwrap_or(ButtonEvent::Short);
 
-            // Drain any extra queued button presses (rapid pressing)
-            // Keep track if any was a long press
-            let mut is_long = press_type == PressType::Long;
-            while let Ok(extra) = rx.try_recv() {
-                if extra == PressType::Long {
-                    is_long = true;
-                }
+            // Debounce: ignore if too soon after last press
+            if last_press_time.elapsed() < std::time::Duration::from_millis(DEBOUNCE_MS) {
+                // Drain any pending events and continue waiting
+                while rx.try_recv().is_ok() {}
+                continue;
             }
 
-            // Track button press
-            sentry::add_breadcrumb(sentry::Breadcrumb {
-                category: Some("input".into()),
-                message: Some(format!(
-                    "Button {} press",
-                    if is_long { "long" } else { "short" }
-                )),
-                level: sentry::Level::Info,
-                ..Default::default()
-            });
+            last_press_time = std::time::Instant::now();
 
-            // Stop everything and clear buffer immediately
-            pipeline.stop();
+            // If we got a Down event, handle button held state
+            if event == ButtonEvent::Down {
+                // Stop everything immediately
+                pipeline.stop();
 
-            // Immediate audio feedback
-            pipeline.beep();
+                // Immediately advance state (skip behavior on button down)
+                let pending_state = state.next(num_channels);
+                info!("Button down - advancing to {:?}", pending_state);
 
-            // Handle long press: jump directly to Off state
-            if is_long {
-                info!("Long press detected - jumping to Off");
-                state = RadioState::Off;
+                // Handle button down with continuous beep
+                let final_event = handle_button_down(&mut pipeline, &rx);
+
+                // Track button press
+                let is_long = final_event == ButtonEvent::Long;
+                sentry::add_breadcrumb(sentry::Breadcrumb {
+                    category: Some("input".into()),
+                    message: Some(format!(
+                        "Button {} press",
+                        if is_long { "long" } else { "short" }
+                    )),
+                    level: sentry::Level::Info,
+                    ..Default::default()
+                });
+
+                // Handle long press: override to Off state
+                if is_long {
+                    info!("Long press detected - jumping to Off");
+                    state = RadioState::Off;
+                } else {
+                    // Short press: use the pending state we calculated
+                    state = pending_state;
+                }
             } else {
-                // Short press: transition to next state
-                state = state.next(num_channels);
+                // Got Short or Long directly (shouldn't happen normally, but handle it)
+                pipeline.stop();
+                pipeline.beep();
+                if event == ButtonEvent::Long {
+                    state = RadioState::Off;
+                } else {
+                    state = state.next(num_channels);
+                }
             }
         }
         skip_wait = false; // Reset flag
@@ -243,12 +262,25 @@ fn run_radio() -> Result<()> {
             }
             RadioState::Playing(idx) => {
                 // Play channel with interrupt support
-                if !play_channel(&mut pipeline, &tts, idx, &rx) {
-                    // Interrupted - advance to next state and process immediately
-                    state = state.next(num_channels);
+                if let Some(event) = play_channel(&mut pipeline, &tts, idx, &rx) {
+                    // Interrupted by button - handle the event
                     pipeline.stop();
-                    pipeline.beep();
-                    skip_wait = true; // Don't wait, process new state now
+
+                    let final_event = if event == ButtonEvent::Down {
+                        // Button just pressed - handle with continuous beep
+                        handle_button_down(&mut pipeline, &rx)
+                    } else {
+                        // Got Short or Long directly
+                        event
+                    };
+
+                    if final_event == ButtonEvent::Long {
+                        state = RadioState::Off;
+                    } else {
+                        state = state.next(num_channels);
+                    }
+
+                    skip_wait = true;
                     continue;
                 }
             }
@@ -262,6 +294,9 @@ fn run_radio() -> Result<()> {
     }
 }
 
+/// Debounce duration - ignore presses within this window (milliseconds)
+const DEBOUNCE_MS: u64 = 300;
+
 /// How often to check stream status (milliseconds)
 const STREAM_CHECK_INTERVAL_MS: u64 = 500;
 
@@ -270,14 +305,39 @@ const RECONNECT_INITIAL_SECS: u64 = 2; // Start with 2 second retry
 const RECONNECT_MAX_SECS: u64 = 60; // Cap at 60 seconds
 const RECONNECT_SILENT_RETRIES: u32 = 3; // Silent retries before announcing
 
+/// Handle button down event: play continuous beep, wait for Short/Long
+/// Returns the final event (Short or Long) indicating how the press ended
+fn handle_button_down(
+    pipeline: &mut audio::AudioPipeline,
+    rx: &Receiver<ButtonEvent>,
+) -> ButtonEvent {
+    // Start continuous beep while button is held
+    pipeline.start_beep();
+
+    // Wait for final event (Short or Long)
+    let final_event = loop {
+        match rx.recv() {
+            Ok(ButtonEvent::Short) => break ButtonEvent::Short,
+            Ok(ButtonEvent::Long) => break ButtonEvent::Long,
+            Ok(ButtonEvent::Down) => continue, // Ignore extra Down events
+            Err(_) => break ButtonEvent::Short, // Default on error
+        }
+    };
+
+    // Stop the beep
+    pipeline.stop_beep();
+
+    final_event
+}
+
 /// Play a channel with interrupt support and auto-reconnect
-/// Returns false if interrupted (caller should continue loop)
+/// Returns None if completed normally, Some(event) if interrupted by button
 fn play_channel(
     pipeline: &mut audio::AudioPipeline,
     tts: &tts::PiperTts,
     idx: usize,
-    rx: &Receiver<PressType>,
-) -> bool {
+    rx: &Receiver<ButtonEvent>,
+) -> Option<ButtonEvent> {
     let channel = &channels::CHANNELS[idx];
     info!("Channel {}: {}", idx + 1, channel.name);
 
@@ -291,13 +351,20 @@ fn play_channel(
     // Announce channel name (interruptible)
     if !pipeline.announce_interruptible(channel.tts_name, tts, Some(rx)) {
         info!("Interrupted during channel name");
-        return false;
+        // Check what event interrupted us
+        if let Ok(event) = rx.try_recv() {
+            return Some(event);
+        }
+        return Some(ButtonEvent::Down); // Default to Down if we can't get the event
     }
 
     // Announce connecting (interruptible)
     if !pipeline.announce_interruptible("Connecting", tts, Some(rx)) {
         info!("Interrupted during connecting");
-        return false;
+        if let Ok(event) = rx.try_recv() {
+            return Some(event);
+        }
+        return Some(ButtonEvent::Down);
     }
 
     // Main playback loop with auto-reconnect and exponential backoff
@@ -316,9 +383,9 @@ fn play_channel(
             // Monitor stream - check for button press or stream disconnect
             loop {
                 // Check for button interrupt
-                if rx.try_recv().is_ok() {
+                if let Ok(event) = rx.try_recv() {
                     info!("Interrupted by button press");
-                    return false;
+                    return Some(event);
                 }
 
                 // Check if stream is still active
@@ -353,7 +420,10 @@ fn play_channel(
                 if !pipeline.announce_interruptible("Connection lost. Reconnecting.", tts, Some(rx))
                 {
                     info!("Interrupted during reconnect announcement");
-                    return false;
+                    if let Ok(event) = rx.try_recv() {
+                        return Some(event);
+                    }
+                    return Some(ButtonEvent::Down);
                 }
             } else {
                 info!(
@@ -381,7 +451,10 @@ fn play_channel(
                 );
                 if !pipeline.announce_interruptible("Connection failed. Retrying.", tts, Some(rx)) {
                     info!("Interrupted during retry announcement");
-                    return false;
+                    if let Ok(event) = rx.try_recv() {
+                        return Some(event);
+                    }
+                    return Some(ButtonEvent::Down);
                 }
             } else {
                 info!(
@@ -396,9 +469,9 @@ fn play_channel(
         let wait_until = std::time::Instant::now() + std::time::Duration::from_secs(retry_interval);
 
         while std::time::Instant::now() < wait_until {
-            if rx.try_recv().is_ok() {
+            if let Ok(event) = rx.try_recv() {
                 info!("Interrupted during reconnect wait");
-                return false;
+                return Some(event);
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }

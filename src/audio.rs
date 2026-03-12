@@ -1,4 +1,4 @@
-use crate::button::PressType;
+use crate::button::ButtonEvent;
 use anyhow::{anyhow, Result};
 use log::{debug, error, info, warn};
 use rodio::buffer::SamplesBuffer;
@@ -208,6 +208,40 @@ impl AudioPipeline {
         self.sink.sleep_until_end(); // Wait for beep to play
     }
 
+    /// Start continuous beep (non-blocking) - plays until stop_beep is called
+    /// Generates a long tone that will be cut off when stop_beep is called
+    pub fn start_beep(&self) {
+        // Generate a 5 second 880Hz sine wave (long enough for any button hold)
+        let sample_rate = 44100u32;
+        let duration_ms = 5000; // 5 seconds max
+        let frequency = 880.0f32;
+        let num_samples = (sample_rate as usize * duration_ms) / 1000;
+
+        let fade_samples = sample_rate as usize / 20; // 50ms fade
+
+        let samples: Vec<f32> = (0..num_samples)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                let envelope = if i < fade_samples {
+                    // Fade in
+                    i as f32 / fade_samples as f32
+                } else {
+                    1.0
+                };
+                (t * frequency * 2.0 * std::f32::consts::PI).sin() * BEEP_VOLUME * envelope
+            })
+            .collect();
+
+        let source = SamplesBuffer::new(1, sample_rate, samples);
+        self.sink.append(source);
+        self.sink.play();
+    }
+
+    /// Stop the continuous beep
+    pub fn stop_beep(&self) {
+        self.sink.clear();
+    }
+
     /// Play TTS announcement
     ///
     /// Plays TTS through the sink. Returns true if completed, false if interrupted.
@@ -216,7 +250,7 @@ impl AudioPipeline {
         &mut self,
         text: &str,
         tts: &crate::tts::PiperTts,
-        interrupt_rx: Option<&std::sync::mpsc::Receiver<PressType>>,
+        interrupt_rx: Option<&std::sync::mpsc::Receiver<ButtonEvent>>,
     ) -> bool {
         info!("TTS: {}", text);
 

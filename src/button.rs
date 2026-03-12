@@ -2,12 +2,14 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use log::info;
 use std::time::Duration;
 
-/// Type of button press detected
+/// Button events sent to main thread
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PressType {
-    /// Short press - cycle to next channel
+pub enum ButtonEvent {
+    /// Button pressed down - start feedback (beep)
+    Down,
+    /// Short press completed (released before threshold)
     Short,
-    /// Long press (held for 2+ seconds) - jump to Off state
+    /// Long press threshold reached (while still held)
     Long,
 }
 
@@ -17,7 +19,10 @@ pub const LONG_PRESS_MS: u64 = 2000;
 
 /// Trait for button input abstraction
 pub trait ButtonInput: Send + Sync {
-    fn wait_for_press(&self) -> PressType;
+    /// Wait for button press and send events through the channel
+    /// Sends ButtonEvent::Down immediately when pressed,
+    /// then ButtonEvent::Short or ButtonEvent::Long when determined
+    fn wait_for_press(&self, tx: &std::sync::mpsc::Sender<ButtonEvent>);
     fn is_gpio(&self) -> bool;
 }
 
@@ -34,28 +39,17 @@ pub trait PinReader: Send + Sync {
     fn read(&self) -> PinLevel;
 }
 
-/// Single source of truth for input debounce duration
-/// Time to wait after pressing stops before registering the action
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub const INPUT_DEBOUNCE_MS: u64 = 150;
-
 /// Button configuration
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct ButtonConfig {
-    /// Poll interval for reading pin state
+    /// Poll interval for reading pin state (milliseconds)
     pub poll_ms: u64,
-    /// Debounce duration - input only registers after this much idle time (no activity)
-    /// This prevents rapid repeated presses - user must stop pressing for this duration
-    pub debounce_ms: u64,
 }
 
 impl Default for ButtonConfig {
     fn default() -> Self {
-        Self {
-            poll_ms: 10,
-            debounce_ms: INPUT_DEBOUNCE_MS,
-        }
+        Self { poll_ms: 10 }
     }
 }
 
@@ -152,18 +146,23 @@ impl KeyboardButton {
 }
 
 impl ButtonInput for KeyboardButton {
-    fn wait_for_press(&self) -> PressType {
+    fn wait_for_press(&self, tx: &std::sync::mpsc::Sender<ButtonEvent>) {
         // Wait for any key press
         loop {
             let level = self.reader.read();
             if level == PinLevel::Low {
+                // Send Down event first
+                let _ = tx.send(ButtonEvent::Down);
+
                 // Check if it was the 'o' key (long press simulation)
                 if self.reader.take_long_press() {
                     info!("Keyboard: Long press (Off) detected");
-                    return PressType::Long;
+                    let _ = tx.send(ButtonEvent::Long);
+                    return;
                 }
                 info!("Keyboard: Short press detected");
-                return PressType::Short;
+                let _ = tx.send(ButtonEvent::Short);
+                return;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -175,10 +174,9 @@ impl ButtonInput for KeyboardButton {
 }
 
 /// Generic button that works with any PinReader implementation
-/// Uses trailing edge debounce:
-/// - Press detected: start timer
-/// - More presses: reset timer
-/// - No presses for debounce_ms: register action
+/// Immediate response behavior:
+/// - Short press: detected on button release (before long threshold)
+/// - Long press: detected immediately when threshold reached while still held
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct GenericGpioButton<P: PinReader> {
     pin: P,
@@ -191,70 +189,63 @@ impl<P: PinReader> GenericGpioButton<P> {
         Self { pin, config }
     }
 
-    /// Wait for a debounced button press and detect short vs long press
+    /// Wait for button press and send events through channel
     ///
-    /// Behavior:
-    /// 1. Wait for button press (Low)
-    /// 2. Track how long button is held
-    /// 3. When released, determine if short or long press based on hold duration
-    /// 4. Apply debounce before returning
-    pub fn wait_for_press_debounced(&self) -> PressType {
+    /// Sends events:
+    /// 1. ButtonEvent::Down - immediately when button pressed
+    /// 2. ButtonEvent::Short - if released before LONG_PRESS_MS
+    ///    OR ButtonEvent::Long - if held for LONG_PRESS_MS (immediate, don't wait for release)
+    fn detect_press(&self, tx: &std::sync::mpsc::Sender<ButtonEvent>) {
         use std::thread;
         use std::time::{Duration, Instant};
 
-        let debounce = Duration::from_millis(self.config.debounce_ms);
-        let long_press = Duration::from_millis(LONG_PRESS_MS);
+        let long_press_threshold = Duration::from_millis(LONG_PRESS_MS);
         let poll = Duration::from_millis(self.config.poll_ms);
 
-        // Wait for first press
+        // Wait for button down (Low)
         loop {
             let level = self.pin.read();
             if level == PinLevel::Low {
-                info!("Button: Press detected, tracking hold duration...");
+                info!("Button: Press detected - sending Down event");
+                let _ = tx.send(ButtonEvent::Down);
                 break;
             }
             thread::sleep(poll);
         }
 
-        // Track press duration
+        // Track how long button is held
         let press_start = Instant::now();
-        let mut last_press = Instant::now();
 
         loop {
+            thread::sleep(poll);
             let level = self.pin.read();
 
-            if level == PinLevel::Low {
-                // Still pressing - update last press time
-                last_press = Instant::now();
+            // Check if long press threshold reached while still held
+            if press_start.elapsed() >= long_press_threshold && level == PinLevel::Low {
+                info!(
+                    "Button: Long press ({:.1}s) - triggering immediately",
+                    press_start.elapsed().as_secs_f32()
+                );
+                let _ = tx.send(ButtonEvent::Long);
+                return;
             }
 
-            // Check if released (idle for debounce period)
-            if last_press.elapsed() >= debounce {
-                let hold_duration = last_press.duration_since(press_start);
-                let press_type = if hold_duration >= long_press {
-                    info!(
-                        "Button: Long press registered ({:.1}s held)",
-                        hold_duration.as_secs_f32()
-                    );
-                    PressType::Long
-                } else {
-                    info!(
-                        "Button: Short press registered ({:.1}s held)",
-                        hold_duration.as_secs_f32()
-                    );
-                    PressType::Short
-                };
-                return press_type;
+            // Check if released before threshold
+            if level == PinLevel::High {
+                info!(
+                    "Button: Short press ({:.1}s)",
+                    press_start.elapsed().as_secs_f32()
+                );
+                let _ = tx.send(ButtonEvent::Short);
+                return;
             }
-
-            thread::sleep(poll);
         }
     }
 }
 
 impl<P: PinReader> ButtonInput for GenericGpioButton<P> {
-    fn wait_for_press(&self) -> PressType {
-        self.wait_for_press_debounced()
+    fn wait_for_press(&self, tx: &std::sync::mpsc::Sender<ButtonEvent>) {
+        self.detect_press(tx)
     }
 
     fn is_gpio(&self) -> bool {
@@ -300,8 +291,8 @@ impl GpioButton {
 
 #[cfg(target_os = "linux")]
 impl ButtonInput for GpioButton {
-    fn wait_for_press(&self) -> PressType {
-        self.inner.wait_for_press()
+    fn wait_for_press(&self, tx: &std::sync::mpsc::Sender<ButtonEvent>) {
+        self.inner.wait_for_press(tx)
     }
 
     fn is_gpio(&self) -> bool {
@@ -362,15 +353,15 @@ mod tests {
     // ==================== Configuration Tests ====================
 
     #[test]
-    fn test_input_debounce_constant() {
-        assert_eq!(INPUT_DEBOUNCE_MS, 150);
+    fn test_long_press_constant() {
+        // Long press threshold should be 2 seconds
+        assert_eq!(LONG_PRESS_MS, 2000);
     }
 
     #[test]
     fn test_button_config_default() {
         let config = ButtonConfig::default();
         assert_eq!(config.poll_ms, 10);
-        assert_eq!(config.debounce_ms, INPUT_DEBOUNCE_MS);
     }
 
     #[test]
@@ -380,50 +371,86 @@ mod tests {
         assert_ne!(PinLevel::Low, PinLevel::High);
     }
 
-    // ==================== Debounce Behavior Tests ====================
+    #[test]
+    fn test_press_type_equality() {
+        assert_eq!(ButtonEvent::Short, ButtonEvent::Short);
+        assert_eq!(ButtonEvent::Long, ButtonEvent::Long);
+        assert_ne!(ButtonEvent::Short, ButtonEvent::Long);
+    }
+
+    // ==================== Button Press Behavior Tests ====================
+    // New behavior: immediate response, no debounce
+    // - Short press: detected on button release (before long threshold)
+    // - Long press: detected immediately when threshold reached (while still held)
 
     #[test]
-    fn test_short_press_detection() {
-        // Short press should return PressType::Short
+    fn test_short_press_sends_down_then_short() {
+        // Short press: button down then released before long press threshold
+        // Should send Down, then Short
         let pin = MockPin::new(vec![
-            PinLevel::Low,  // Press detected
-            PinLevel::High, // Released quickly
-            PinLevel::High, // Idle
-            PinLevel::High, // Idle (debounce met)
+            PinLevel::Low,  // Button pressed - sends Down
+            PinLevel::High, // Released quickly - sends Short
         ]);
-        let config = ButtonConfig {
-            poll_ms: 1,
-            debounce_ms: 2,
-        };
+        let config = ButtonConfig::default();
         let button = GenericGpioButton::new(pin, config);
 
-        let press_type = button.wait_for_press();
-        assert_eq!(press_type, PressType::Short);
+        let (tx, rx) = std::sync::mpsc::channel();
+        button.wait_for_press(&tx);
+
+        // Should receive Down first, then Short
+        assert_eq!(rx.recv().unwrap(), ButtonEvent::Down);
+        assert_eq!(rx.recv().unwrap(), ButtonEvent::Short);
     }
 
     #[test]
-    fn test_spam_resets_timer() {
-        // Continuous pressing should reset the timer
+    #[ignore] // Takes 2+ seconds - run with `cargo test -- --ignored`
+    fn test_long_press_sends_down_then_long() {
+        // Long press: button held past threshold triggers immediately
+        // Should send Down, then Long as soon as threshold reached
         let pin = MockPin::new(vec![
-            PinLevel::Low,  // Press 1
-            PinLevel::Low,  // Press 2 (resets timer)
-            PinLevel::Low,  // Press 3 (resets timer)
-            PinLevel::High, // Release
-            PinLevel::High, // Idle
-            PinLevel::High, // Idle (debounce met)
+            PinLevel::Low, // Held... (will trigger Long after threshold)
         ]);
         let config = ButtonConfig {
-            poll_ms: 1,
-            debounce_ms: 2,
+            poll_ms: 10, // Normal polling
         };
         let button = GenericGpioButton::new(pin, config);
 
-        let press_type = button.wait_for_press();
-        // Only registers after spam stops, should be short press
-        assert_eq!(press_type, PressType::Short);
+        let (tx, rx) = std::sync::mpsc::channel();
+        button.wait_for_press(&tx);
+
+        // Should receive Down first, then Long
+        assert_eq!(rx.recv().unwrap(), ButtonEvent::Down);
+        assert_eq!(rx.recv().unwrap(), ButtonEvent::Long);
     }
 
-    // ==================== Integration Tests ====================
+    #[test]
+    fn test_multiple_short_presses() {
+        // Each press-release cycle should send Down+Short
+        let pin = MockPin::new(vec![
+            // First press
+            PinLevel::Low,  // Press - sends Down
+            PinLevel::High, // Release - sends Short
+            // Second press
+            PinLevel::Low,  // Press - sends Down
+            PinLevel::High, // Release - sends Short
+        ]);
+        let config = ButtonConfig::default();
+        let button = GenericGpioButton::new(pin, config);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        // First press
+        button.wait_for_press(&tx);
+        assert_eq!(rx.recv().unwrap(), ButtonEvent::Down);
+        assert_eq!(rx.recv().unwrap(), ButtonEvent::Short);
+
+        // Second press
+        button.wait_for_press(&tx);
+        assert_eq!(rx.recv().unwrap(), ButtonEvent::Down);
+        assert_eq!(rx.recv().unwrap(), ButtonEvent::Short);
+    }
+
+    // ==================== Mock Infrastructure Tests ====================
 
     #[test]
     fn test_mock_pin_returns_sequence() {
@@ -443,86 +470,13 @@ mod tests {
 
     #[test]
     fn test_generic_gpio_button_is_gpio() {
-        let pin = MockPin::new(vec![PinLevel::Low]);
-        let config = ButtonConfig {
-            poll_ms: 1,
-            debounce_ms: 1,
-        };
+        let pin = MockPin::new(vec![PinLevel::Low, PinLevel::High]);
+        let config = ButtonConfig::default();
         let button = GenericGpioButton::new(pin, config);
         assert!(button.is_gpio());
     }
 
-    #[test]
-    fn test_debounce_requires_sustained_idle() {
-        // Press should NOT register until full debounce period passes
-        // This test uses longer debounce to ensure idle period matters
-        let pin = MockPin::new(vec![
-            PinLevel::Low,  // Press
-            PinLevel::High, // Release
-            PinLevel::Low,  // Bounce! (within debounce window)
-            PinLevel::High, // Release again
-            PinLevel::High, // Idle 1
-            PinLevel::High, // Idle 2
-            PinLevel::High, // Idle 3 (debounce met after this)
-        ]);
-        let config = ButtonConfig {
-            poll_ms: 1,
-            debounce_ms: 3, // Requires 3 idle reads
-        };
-
-        let button = GenericGpioButton::new(pin, config);
-        let press_type = button.wait_for_press();
-        // Bouncy press still registers as single short press
-        assert_eq!(press_type, PressType::Short);
-    }
-
-    #[test]
-    fn test_multiple_presses_only_one_action() {
-        // Multiple rapid presses should result in one action after idle
-        let pin = MockPin::new(vec![
-            // First wait_for_press
-            PinLevel::Low,  // Press
-            PinLevel::Low,  // Spam
-            PinLevel::Low,  // Spam
-            PinLevel::High, // Release
-            PinLevel::High, // Idle
-            PinLevel::High, // Idle (debounce met) - returns here
-            // Second wait_for_press
-            PinLevel::High, // Idle
-            PinLevel::Low,  // New press
-            PinLevel::High, // Release
-            PinLevel::High, // Idle
-            PinLevel::High, // Idle (debounce met) - returns here
-        ]);
-        let config = ButtonConfig {
-            poll_ms: 1,
-            debounce_ms: 2,
-        };
-        let button = GenericGpioButton::new(pin, config);
-
-        // First action
-        let press1 = button.wait_for_press();
-        assert_eq!(press1, PressType::Short);
-
-        // Second action
-        let press2 = button.wait_for_press();
-        assert_eq!(press2, PressType::Short);
-
-        // Both completed - spam was debounced
-    }
-
-    #[test]
-    fn test_press_type_equality() {
-        assert_eq!(PressType::Short, PressType::Short);
-        assert_eq!(PressType::Long, PressType::Long);
-        assert_ne!(PressType::Short, PressType::Long);
-    }
-
-    #[test]
-    fn test_long_press_constant() {
-        // Long press threshold should be 2 seconds
-        assert_eq!(LONG_PRESS_MS, 2000);
-    }
+    // ==================== Keyboard Simulation Tests ====================
 
     #[test]
     fn test_keyboard_pin_reader_long_press_flag() {
@@ -562,9 +516,6 @@ mod tests {
         assert_eq!(reader.read(), PinLevel::High);
     }
 
-    // Note: GPIO long press detection relies on wall-clock time (2 seconds hold).
-    // Testing this would require either:
-    // 1. A 2+ second test (too slow for unit tests)
-    // 2. Dependency injection for time/clock (added complexity)
-    // The keyboard simulation tests above verify the flag mechanism works.
+    // Note: test_long_press_triggers_while_held uses real wall-clock time (2 seconds).
+    // For faster CI, this test is marked #[ignore] - run with `cargo test -- --ignored`
 }
