@@ -59,13 +59,8 @@ pub fn do_update_to(version: Option<&str>) -> Result<()> {
     let arch = std::env::consts::ARCH;
     let os = std::env::consts::OS;
 
-    let binary_name = match (os, arch) {
-        ("linux", "aarch64") => "lego-radio-arm64",
-        ("linux", "x86_64") => "lego-radio-x86_64",
-        ("macos", "aarch64") => "lego-radio-darwin-arm64",
-        ("macos", "x86_64") => "lego-radio-darwin-x86_64",
-        _ => return Err(anyhow!("Unsupported platform: {}-{}", os, arch)),
-    };
+    let binary_name = get_binary_name(os, arch)
+        .ok_or_else(|| anyhow!("Unsupported platform: {}-{}", os, arch))?;
 
     let url = format!(
         "https://github.com/{}/releases/latest/download/{}",
@@ -133,6 +128,17 @@ pub fn do_update_to(version: Option<&str>) -> Result<()> {
 /// Download and install the latest version (checks for update first)
 pub fn do_update() -> Result<()> {
     do_update_to(None)
+}
+
+/// Get binary name for a given OS/architecture combination
+fn get_binary_name(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        ("linux", "aarch64") => Some("lego-radio-arm64"),
+        ("linux", "x86_64") => Some("lego-radio-x86_64"),
+        ("macos", "aarch64") => Some("lego-radio-darwin-arm64"),
+        ("macos", "x86_64") => Some("lego-radio-darwin-x86_64"),
+        _ => None,
+    }
 }
 
 /// Compare semantic versions (returns true if a > b)
@@ -217,23 +223,28 @@ mod tests {
 
     #[test]
     fn test_binary_name_selection() {
-        let platforms = [
-            (("linux", "aarch64"), "lego-radio-arm64"),
-            (("linux", "x86_64"), "lego-radio-x86_64"),
-            (("macos", "aarch64"), "lego-radio-darwin-arm64"),
-            (("macos", "x86_64"), "lego-radio-darwin-x86_64"),
-        ];
+        // Test all supported platforms
+        assert_eq!(
+            get_binary_name("linux", "aarch64"),
+            Some("lego-radio-arm64")
+        );
+        assert_eq!(
+            get_binary_name("linux", "x86_64"),
+            Some("lego-radio-x86_64")
+        );
+        assert_eq!(
+            get_binary_name("macos", "aarch64"),
+            Some("lego-radio-darwin-arm64")
+        );
+        assert_eq!(
+            get_binary_name("macos", "x86_64"),
+            Some("lego-radio-darwin-x86_64")
+        );
 
-        for ((os, arch), expected) in platforms {
-            let binary_name = match (os, arch) {
-                ("linux", "aarch64") => "lego-radio-arm64",
-                ("linux", "x86_64") => "lego-radio-x86_64",
-                ("macos", "aarch64") => "lego-radio-darwin-arm64",
-                ("macos", "x86_64") => "lego-radio-darwin-x86_64",
-                _ => panic!("Unsupported"),
-            };
-            assert_eq!(binary_name, expected);
-        }
+        // Test unsupported platforms return None
+        assert_eq!(get_binary_name("windows", "x86_64"), None);
+        assert_eq!(get_binary_name("linux", "armv7"), None);
+        assert_eq!(get_binary_name("freebsd", "aarch64"), None);
     }
 
     #[test]

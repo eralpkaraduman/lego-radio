@@ -109,14 +109,38 @@ mod tests {
     }
 
     #[test]
-    fn test_tts_names_readable() {
+    fn test_tts_names_spell_out_abbreviations() {
         for channel in CHANNELS {
-            // TTS names should be readable (no compressed abbreviations)
+            // Common abbreviations should be spelled out with spaces for TTS clarity
+            // "BBC" -> "B B C", "YLE" -> "Y L E"
+            // Or abbreviations can be omitted entirely (e.g., "FM" dropped from "Soma FM")
+            let has_unspaced_abbrev = channel.tts_name.contains("BBC")
+                || channel.tts_name.contains("YLE")
+                || channel.tts_name.contains("NPR");
+
             assert!(
-                !channel.tts_name.contains("YLE") && !channel.tts_name.contains("FM"),
-                "TTS name should spell out abbreviations: {}",
+                !has_unspaced_abbrev,
+                "TTS name '{}' contains unspaced abbreviation - should use 'B B C' style or omit",
                 channel.tts_name
             );
+        }
+    }
+
+    #[test]
+    fn test_tts_names_differ_from_display_names_when_needed() {
+        // Channels with abbreviations should have different TTS names
+        for channel in CHANNELS {
+            let has_abbrev = channel.name.contains("BBC")
+                || channel.name.contains("YLE")
+                || channel.name.contains("FM");
+
+            if has_abbrev {
+                assert_ne!(
+                    channel.name, channel.tts_name,
+                    "Channel '{}' has abbreviation but TTS name is identical",
+                    channel.name
+                );
+            }
         }
     }
 }

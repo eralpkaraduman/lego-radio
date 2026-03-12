@@ -1,3 +1,4 @@
+use crate::button::PressType;
 use anyhow::{anyhow, Result};
 use log::{debug, error, info, warn};
 use rodio::buffer::SamplesBuffer;
@@ -215,7 +216,7 @@ impl AudioPipeline {
         &mut self,
         text: &str,
         tts: &crate::tts::PiperTts,
-        interrupt_rx: Option<&std::sync::mpsc::Receiver<()>>,
+        interrupt_rx: Option<&std::sync::mpsc::Receiver<PressType>>,
     ) -> bool {
         info!("TTS: {}", text);
 
@@ -632,8 +633,8 @@ fn demux_ts_audio(ts_data: &[u8]) -> Vec<u8> {
 
         // Check if this looks like audio (common audio PIDs or detect from stream)
         // BBC typically uses PID 0x22 (34) or similar for audio
-        let is_audio_pid = audio_pid.map(|p| p == pid).unwrap_or(false)
-            || (pid >= 0x20 && pid <= 0x1FFF && pid != 0x1FFF);
+        let is_audio_pid =
+            audio_pid.map(|p| p == pid).unwrap_or(false) || (0x20..0x1FFF).contains(&pid);
 
         if !is_audio_pid && audio_pid.is_some() {
             continue;
@@ -651,7 +652,7 @@ fn demux_ts_audio(ts_data: &[u8]) -> Vec<u8> {
             let stream_id = payload[3];
 
             // Audio stream IDs: 0xC0-0xDF (MPEG audio), 0xBD (private/AAC)
-            if (stream_id >= 0xC0 && stream_id <= 0xDF) || stream_id == 0xBD {
+            if (0xC0..=0xDF).contains(&stream_id) || stream_id == 0xBD {
                 if audio_pid.is_none() {
                     audio_pid = Some(pid);
                     debug!("HLS: found audio on PID {}", pid);

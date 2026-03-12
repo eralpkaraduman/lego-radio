@@ -6,6 +6,7 @@ mod tts;
 mod updater;
 
 use anyhow::Result;
+use button::PressType;
 use log::{error, info, warn};
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Receiver;
@@ -116,8 +117,11 @@ OPTIONS:
     --test-stream [URL] Test audio streaming
 
 CONTROLS:
-    On Raspberry Pi: Channel switch (GPIO) cycles stations
-    On Mac/Desktop:  Press Enter to cycle stations
+    Short press: Cycle to next channel
+    Long press (2s): Jump to OFF state
+
+    On Raspberry Pi: GPIO button on pin 17
+    On Mac/Desktop:  Enter/Space=cycle, O=off
 
 Channels cycle: Welcome → 1 → 2 → ... → N → OFF → Welcome
 "#,
@@ -153,17 +157,17 @@ fn run_radio() -> Result<()> {
     metrics::start_metrics_thread(metrics_stop.clone());
 
     // Channel for button events (input thread -> main thread)
-    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let (tx, rx) = std::sync::mpsc::channel::<PressType>();
 
     // Button input in background thread
     std::thread::spawn(move || {
         let button = button::create_button();
         if !button.is_gpio() {
-            info!("(Press Enter to cycle channels)");
+            info!("(Enter/Space=cycle, O=off)");
         }
         loop {
-            button.wait_for_press();
-            let _ = tx.send(());
+            let press_type = button.wait_for_press();
+            let _ = tx.send(press_type);
         }
     });
 
@@ -182,15 +186,24 @@ fn run_radio() -> Result<()> {
     loop {
         if !skip_wait {
             // Wait for button press
-            rx.recv().ok();
+            let press_type = rx.recv().unwrap_or(PressType::Short);
 
             // Drain any extra queued button presses (rapid pressing)
-            while rx.try_recv().is_ok() {}
+            // Keep track if any was a long press
+            let mut is_long = press_type == PressType::Long;
+            while let Ok(extra) = rx.try_recv() {
+                if extra == PressType::Long {
+                    is_long = true;
+                }
+            }
 
             // Track button press
             sentry::add_breadcrumb(sentry::Breadcrumb {
                 category: Some("input".into()),
-                message: Some("Button pressed".into()),
+                message: Some(format!(
+                    "Button {} press",
+                    if is_long { "long" } else { "short" }
+                )),
                 level: sentry::Level::Info,
                 ..Default::default()
             });
@@ -201,8 +214,14 @@ fn run_radio() -> Result<()> {
             // Immediate audio feedback
             pipeline.beep();
 
-            // Transition to next state
-            state = state.next(num_channels);
+            // Handle long press: jump directly to Off state
+            if is_long {
+                info!("Long press detected - jumping to Off");
+                state = RadioState::Off;
+            } else {
+                // Short press: transition to next state
+                state = state.next(num_channels);
+            }
         }
         skip_wait = false; // Reset flag
 
@@ -257,7 +276,7 @@ fn play_channel(
     pipeline: &mut audio::AudioPipeline,
     tts: &tts::PiperTts,
     idx: usize,
-    rx: &Receiver<()>,
+    rx: &Receiver<PressType>,
 ) -> bool {
     let channel = &channels::CHANNELS[idx];
     info!("Channel {}: {}", idx + 1, channel.name);
