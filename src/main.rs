@@ -17,23 +17,56 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Sentry DSN for crash reporting and metrics
 const SENTRY_DSN: &str = "https://a619cb8b77fe8255cce8eaab57f58108@o4511026110136320.ingest.de.sentry.io/4511027998228560";
 
-/// Radio state machine - explicit states instead of magic index numbers
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Radio state machine (Welcome is handled at startup before this runs)
+///
+/// Playing: stream at 100%. Short press → Browsing.
+/// Browsing: stream ducked to 20%, TTS announces channels. Commit on TTS end + 0.5s grace.
+/// Off: no stream. Short press → Browsing. Long press from any state → Off.
+#[derive(Debug, Clone, PartialEq)]
 enum RadioState {
-    Welcome,
-    Playing(usize), // channel index 0..N-1
+    /// Streaming a channel at full volume.
+    Playing(usize),
+    /// Browsing channels while old stream keeps playing (ducked).
+    /// `playing`: currently streaming channel (None if coming from Off)
+    /// `browse`: channel index being announced via TTS
+    Browsing {
+        playing: Option<usize>,
+        browse: usize,
+    },
+    /// Radio off. No stream.
     Off,
 }
 
 impl RadioState {
-    /// Transition to next state on button press
-    fn next(self, num_channels: usize) -> RadioState {
+    /// Handle short press: enter or advance browsing
+    fn short_press(self, num_channels: usize) -> RadioState {
         match self {
-            RadioState::Welcome => RadioState::Playing(0),
-            RadioState::Playing(i) if i + 1 < num_channels => RadioState::Playing(i + 1),
-            RadioState::Playing(_) => RadioState::Off,
-            RadioState::Off => RadioState::Welcome,
+            RadioState::Playing(ch) => RadioState::Browsing {
+                playing: Some(ch),
+                browse: (ch + 1) % num_channels,
+            },
+            RadioState::Browsing { playing, browse } => RadioState::Browsing {
+                playing,
+                browse: (browse + 1) % num_channels,
+            },
+            RadioState::Off => RadioState::Browsing {
+                playing: None,
+                browse: 0,
+            },
         }
+    }
+
+    /// Commit the browsed channel (TTS finished + grace period elapsed)
+    fn commit(self) -> RadioState {
+        match self {
+            RadioState::Browsing { browse, .. } => RadioState::Playing(browse),
+            other => other,
+        }
+    }
+
+    /// Long press: always go to Off
+    fn long_press(self) -> RadioState {
+        RadioState::Off
     }
 }
 
@@ -173,189 +206,257 @@ fn run_radio_with_button(button: Box<dyn button::ButtonInput>) -> Result<()> {
     let (tx, rx) = std::sync::mpsc::channel::<button::ButtonEvent>();
 
     // Button input in background thread
-    std::thread::spawn(move || {
-        loop {
-            button.wait_for_press(&tx);
-        }
+    std::thread::spawn(move || loop {
+        button.wait_for_press(&tx);
     });
 
-    // State machine starts at Welcome
-    let mut state = RadioState::Welcome;
     let num_channels = channels::CHANNELS.len();
 
-    // Handle Welcome state on startup
+    // Welcome state: blocking, no button input accepted
     handle_welcome(&mut pipeline);
+    while rx.try_recv().is_ok() {} // drain
 
-    // Drain any button presses that happened during welcome
-    while rx.try_recv().is_ok() {}
+    // Auto-play first channel
+    // Auto-play first channel
+    let mut state = RadioState::Playing(0);
+    info!("State: {:?}", state);
+    let first_channel = &channels::CHANNELS[0];
+    pipeline.announce(first_channel.tts_name);
+    start_channel(&mut pipeline, 0);
 
-    let mut skip_wait = false; // Skip waiting for button press (after interrupt)
-
-    // Debounce tracking
-    let mut last_press_time = std::time::Instant::now() - std::time::Duration::from_secs(10);
-
+    // Main event loop
     loop {
-        if !skip_wait {
-            // Wait for button down event
-            let event = rx.recv().unwrap_or(ButtonEvent::Short);
-
-            // Debounce: ignore if too soon after last press
-            if last_press_time.elapsed() < std::time::Duration::from_millis(DEBOUNCE_MS) {
-                // Drain any pending events and continue waiting
-                while rx.try_recv().is_ok() {}
-                continue;
-            }
-
-            last_press_time = std::time::Instant::now();
-
-            // If we got a Down event, handle button held state
-            if event == ButtonEvent::Down {
-                // Stop everything immediately
-                pipeline.stop();
-
-                // Immediately advance state (skip behavior on button down)
-                let pending_state = state.next(num_channels);
-                info!("Button down - advancing to {:?}", pending_state);
-
-                // Handle button down with continuous beep
-                let final_event = handle_button_down(&mut pipeline, &rx);
-
-                // Track button press
-                let is_long = final_event == ButtonEvent::Long;
-                sentry::add_breadcrumb(sentry::Breadcrumb {
-                    category: Some("input".into()),
-                    message: Some(format!(
-                        "Button {} press",
-                        if is_long { "long" } else { "short" }
-                    )),
-                    level: sentry::Level::Info,
-                    ..Default::default()
-                });
-
-                // Handle long press: override to Off state
-                if is_long {
-                    info!("Long press detected - jumping to Off");
-                    state = RadioState::Off;
-                } else {
-                    // Short press: use the pending state we calculated
-                    state = pending_state;
-                }
-            } else {
-                // Got Short or Long directly (shouldn't happen normally, but handle it)
-                pipeline.stop();
-                if event == ButtonEvent::Long {
-                    state = RadioState::Off;
-                } else {
-                    pipeline.confirm_beep();
-                    state = state.next(num_channels);
-                }
-            }
-        }
-        skip_wait = false; // Reset flag
-
-        info!("State: {:?}", state);
-
-        // Add breadcrumb for state transition
-        sentry::add_breadcrumb(sentry::Breadcrumb {
-            category: Some("state".into()),
-            message: Some(format!("State: {:?}", state)),
-            level: sentry::Level::Info,
-            ..Default::default()
-        });
-
-        match state {
-            RadioState::Welcome => {
-                handle_welcome(&mut pipeline);
-                // Drain any presses during welcome
-                while rx.try_recv().is_ok() {}
-            }
-            RadioState::Playing(idx) => {
-                // Play channel with interrupt support
-                if let Some(event) = play_channel(&mut pipeline, idx, &rx) {
-                    // Interrupted by button - handle the event
-                    pipeline.stop();
-
-                    let final_event = if event == ButtonEvent::Down {
-                        // Button just pressed - handle with continuous beep
-                        handle_button_down(&mut pipeline, &rx)
-                    } else {
-                        // Got Short or Long directly - play confirm for short
-                        if event == ButtonEvent::Short {
-                            pipeline.confirm_beep();
+        match &state {
+            RadioState::Playing(_) => {
+                // Wait for button event or stream disconnect
+                match wait_for_event(&pipeline, &rx) {
+                    RadioEvent::ButtonDown => {
+                        let press = handle_button_press(&mut pipeline, &rx);
+                        if press == ButtonEvent::Long {
+                            state = state.long_press();
+                            handle_state_enter(&mut pipeline, &state);
+                        } else {
+                            state = state.short_press(num_channels);
+                            handle_state_enter(&mut pipeline, &state);
                         }
-                        event
-                    };
-
-                    if final_event == ButtonEvent::Long {
-                        state = RadioState::Off;
-                    } else {
-                        state = state.next(num_channels);
                     }
-
-                    skip_wait = true;
-                    continue;
+                    RadioEvent::StreamEnded => {
+                        handle_reconnect(&mut pipeline, &state, &rx);
+                    }
+                }
+            }
+            RadioState::Browsing { .. } => {
+                // Wait for TTS to finish + grace period, or button press
+                match wait_for_tts_or_button(&pipeline, &rx) {
+                    BrowseEvent::ButtonDown => {
+                        let press = handle_button_press(&mut pipeline, &rx);
+                        if press == ButtonEvent::Long {
+                            state = state.long_press();
+                            handle_state_enter(&mut pipeline, &state);
+                        } else {
+                            state = state.short_press(num_channels);
+                            handle_state_enter(&mut pipeline, &state);
+                        }
+                    }
+                    BrowseEvent::Commit => {
+                        // TTS finished + grace elapsed, commit the channel
+                        let old_playing = if let RadioState::Browsing { playing, .. } = &state {
+                            *playing
+                        } else {
+                            None
+                        };
+                        let new_state = state.commit();
+                        if let RadioState::Playing(new_ch) = &new_state {
+                            if old_playing == Some(*new_ch) {
+                                // Same channel — just restore volume
+                                info!("Commit: same channel, restoring volume");
+                                pipeline.restore_stream();
+                            } else {
+                                // Different channel — stop old, connect new
+                                info!("Commit: switching to channel {}", new_ch);
+                                pipeline.stop_stream();
+                                pipeline.restore_stream();
+                                start_channel(&mut pipeline, *new_ch);
+                            }
+                        }
+                        state = new_state;
+                    }
                 }
             }
             RadioState::Off => {
-                info!("Radio OFF");
-                pipeline.announce("Radio off");
-                // Drain any presses during announcement
-                while rx.try_recv().is_ok() {}
+                // Wait for voice ("Radio off") to finish, interruptible
+                while pipeline.is_voice_playing() {
+                    if let Ok(ButtonEvent::Down) = rx.try_recv() {
+                        pipeline.stop_voice();
+                        let press = handle_button_press(&mut pipeline, &rx);
+                        if press != ButtonEvent::Long {
+                            // Turn back on: full welcome sequence
+                            handle_welcome(&mut pipeline);
+                            while rx.try_recv().is_ok() {}
+                            state = RadioState::Playing(0);
+                            let first_channel = &channels::CHANNELS[0];
+                            pipeline.announce(first_channel.tts_name);
+                            start_channel(&mut pipeline, 0);
+                        }
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+
+                // If still Off, wait for button press
+                if state == RadioState::Off {
+                    loop {
+                        match rx.recv() {
+                            Ok(ButtonEvent::Down) => {
+                                let press = handle_button_press(&mut pipeline, &rx);
+                                if press != ButtonEvent::Long {
+                                    // Turn back on: full welcome sequence
+                                    handle_welcome(&mut pipeline);
+                                    while rx.try_recv().is_ok() {}
+                                    state = RadioState::Playing(0);
+                                    let first_channel = &channels::CHANNELS[0];
+                                    pipeline.announce(first_channel.tts_name);
+                                    start_channel(&mut pipeline, 0);
+                                }
+                                break;
+                            }
+                            Ok(_) => continue,
+                            Err(_) => break,
+                        }
+                    }
+                }
             }
         }
+
+        info!("State: {:?}", state);
     }
 }
 
-/// Debounce duration - ignore presses within this window (milliseconds)
-const DEBOUNCE_MS: u64 = 300;
+/// Grace period after TTS finishes before committing channel (milliseconds)
+const BROWSE_GRACE_MS: u64 = 500;
 
 /// How often to check stream status (milliseconds)
 const STREAM_CHECK_INTERVAL_MS: u64 = 500;
 
 /// Reconnection strategy with exponential backoff
-const RECONNECT_INITIAL_SECS: u64 = 2; // Start with 2 second retry
-const RECONNECT_MAX_SECS: u64 = 60; // Cap at 60 seconds
-const RECONNECT_SILENT_RETRIES: u32 = 3; // Silent retries before announcing
+const RECONNECT_INITIAL_SECS: u64 = 2;
+const RECONNECT_MAX_SECS: u64 = 60;
+const RECONNECT_SILENT_RETRIES: u32 = 3;
 
-/// Handle button down event: play continuous beep, wait for Short/Long
-/// Returns the final event (Short or Long) indicating how the press ended
-fn handle_button_down(
+/// Events that can happen while Playing
+enum RadioEvent {
+    ButtonDown,
+    StreamEnded,
+}
+
+/// Events that can happen while Browsing
+enum BrowseEvent {
+    ButtonDown,
+    Commit, // TTS finished + grace period elapsed
+}
+
+/// Handle a button Down event: play beep while held, return Short or Long
+fn handle_button_press(
     pipeline: &mut audio::AudioPipeline,
     rx: &Receiver<ButtonEvent>,
 ) -> ButtonEvent {
-    // Start continuous beep while button is held
     pipeline.start_beep();
 
-    // Wait for final event (Short or Long)
     let final_event = loop {
         match rx.recv() {
             Ok(ButtonEvent::Short) => break ButtonEvent::Short,
             Ok(ButtonEvent::Long) => break ButtonEvent::Long,
-            Ok(ButtonEvent::Down) => continue, // Ignore extra Down events
-            Err(_) => break ButtonEvent::Short, // Default on error
+            Ok(ButtonEvent::Down) => continue,
+            Err(_) => break ButtonEvent::Short,
         }
     };
 
-    // Stop the beep
     pipeline.stop_beep();
 
-    // Play confirmation chirp for short press (channel change feedback)
-    if final_event == ButtonEvent::Short {
+    if final_event == ButtonEvent::Long {
+        // Wait for button release — consume events until quiet for 300ms
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(300)) {
+                Ok(_) => continue, // still getting events, button still held
+                Err(_) => break,   // no events for 300ms, button released
+            }
+        }
+    } else {
         pipeline.confirm_beep();
     }
 
     final_event
 }
 
-/// Play a channel with interrupt support and auto-reconnect
-/// Returns None if completed normally, Some(event) if interrupted by button
-fn play_channel(
-    pipeline: &mut audio::AudioPipeline,
-    idx: usize,
+/// Wait for either a button press or stream disconnect
+fn wait_for_event(pipeline: &audio::AudioPipeline, rx: &Receiver<ButtonEvent>) -> RadioEvent {
+    loop {
+        // Check for button press (non-blocking)
+        if let Ok(ButtonEvent::Down) = rx.try_recv() {
+            return RadioEvent::ButtonDown;
+        }
+
+        // Check stream health
+        if !pipeline.is_stream_active() {
+            return RadioEvent::StreamEnded;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(STREAM_CHECK_INTERVAL_MS));
+    }
+}
+
+/// Wait for TTS to finish + grace period, or a button press
+fn wait_for_tts_or_button(
+    pipeline: &audio::AudioPipeline,
     rx: &Receiver<ButtonEvent>,
-) -> Option<ButtonEvent> {
+) -> BrowseEvent {
+    // Wait for voice to finish playing
+    while pipeline.is_voice_playing() {
+        if let Ok(ButtonEvent::Down) = rx.try_recv() {
+            return BrowseEvent::ButtonDown;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // Grace period
+    let grace_end = std::time::Instant::now() + std::time::Duration::from_millis(BROWSE_GRACE_MS);
+    while std::time::Instant::now() < grace_end {
+        if let Ok(ButtonEvent::Down) = rx.try_recv() {
+            return BrowseEvent::ButtonDown;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    BrowseEvent::Commit
+}
+
+/// Enter a new state: play appropriate audio feedback (non-blocking)
+/// The main loop handles waiting for TTS / checking for button presses.
+fn handle_state_enter(pipeline: &mut audio::AudioPipeline, state: &RadioState) {
+    match state {
+        RadioState::Browsing { playing, browse } => {
+            if playing.is_some() {
+                pipeline.duck_stream();
+            }
+            let channel = &channels::CHANNELS[*browse];
+            info!("Browsing: {}", channel.name);
+            pipeline.speak(channel.tts_name);
+        }
+        RadioState::Off => {
+            pipeline.stop_stream();
+            info!("Radio OFF");
+            pipeline.speak("Radio off");
+        }
+        RadioState::Playing(idx) => {
+            info!("Playing: {}", channels::CHANNELS[*idx].name);
+        }
+    }
+}
+
+/// Start playing a channel (connect stream)
+fn start_channel(pipeline: &mut audio::AudioPipeline, idx: usize) {
     let channel = &channels::CHANNELS[idx];
-    info!("Channel {}: {}", idx + 1, channel.name);
+    info!("Connecting to: {}", channel.name);
 
     sentry::add_breadcrumb(sentry::Breadcrumb {
         category: Some("playback".into()),
@@ -364,119 +465,58 @@ fn play_channel(
         ..Default::default()
     });
 
-    // Announce channel name (interruptible)
-    if let Some(event) = pipeline.announce_interruptible(channel.tts_name, Some(rx)) {
-        info!("Interrupted during channel name");
-        return Some(event);
+    if pipeline.connect_and_play(channel.url) {
+        pipeline.fade_in_stream();
+    } else {
+        warn!("Failed to connect to {}", channel.name);
     }
+}
 
-    // Main playback loop with auto-reconnect and exponential backoff
+/// Handle stream reconnection with exponential backoff
+fn handle_reconnect(
+    pipeline: &mut audio::AudioPipeline,
+    state: &RadioState,
+    rx: &Receiver<ButtonEvent>,
+) {
+    let idx = match state {
+        RadioState::Playing(i) => *i,
+        _ => return,
+    };
+
+    let channel = &channels::CHANNELS[idx];
     let mut retry_count: u32 = 0;
     let mut retry_interval = RECONNECT_INITIAL_SECS;
 
     loop {
-        // Try to connect
-        if pipeline.connect_and_play(channel.url) {
-            info!("Stream connected, monitoring playback");
-
-            // Reset retry state on successful connection
-            retry_count = 0;
-            retry_interval = RECONNECT_INITIAL_SECS;
-
-            // Monitor stream - check for button press or stream disconnect
-            loop {
-                // Check for button interrupt
-                if let Ok(event) = rx.try_recv() {
-                    info!("Interrupted by button press");
-                    return Some(event);
-                }
-
-                // Check if stream is still active
-                if !pipeline.is_stream_active() {
-                    warn!("Stream disconnected, will reconnect");
-                    sentry::add_breadcrumb(sentry::Breadcrumb {
-                        category: Some("connection".into()),
-                        message: Some(format!("Stream disconnected: {}", channel.name)),
-                        level: sentry::Level::Warning,
-                        ..Default::default()
-                    });
-                    break; // Exit monitor loop, will reconnect
-                }
-
-                std::thread::sleep(std::time::Duration::from_millis(STREAM_CHECK_INTERVAL_MS));
-            }
-
-            // Stream disconnected - silent retry first
-            retry_count += 1;
-
-            if retry_count > RECONNECT_SILENT_RETRIES {
-                // Send Sentry event for persistent connection issues
-                sentry::capture_message(
-                    &format!(
-                        "Stream reconnection required: {} (attempt {})",
-                        channel.name, retry_count
-                    ),
-                    sentry::Level::Warning,
-                );
-
-                // Announce only after silent retries exhausted
-                if let Some(event) =
-                    pipeline.announce_interruptible("Connection lost. Reconnecting.", Some(rx))
-                {
-                    info!("Interrupted during reconnect announcement");
-                    return Some(event);
-                }
-            } else {
-                info!(
-                    "Silent reconnect attempt {} of {}",
-                    retry_count, RECONNECT_SILENT_RETRIES
-                );
+        retry_count += 1;
+        if retry_count > RECONNECT_SILENT_RETRIES {
+            warn!("Reconnecting to {} (attempt {})", channel.name, retry_count);
+            if let Some(ButtonEvent::Down) =
+                pipeline.announce_interruptible("Connection lost. Reconnecting.", Some(rx))
+            {
+                return; // interrupted by button, main loop will handle
             }
         } else {
-            // Connection failed
-            retry_count += 1;
-
-            if retry_count > RECONNECT_SILENT_RETRIES {
-                // Send Sentry event for connection failures
-                sentry::capture_message(
-                    &format!(
-                        "Stream connection failed: {} (attempt {})",
-                        channel.name, retry_count
-                    ),
-                    sentry::Level::Warning,
-                );
-
-                error!(
-                    "Connection failed for {} (attempt {})",
-                    channel.name, retry_count
-                );
-                if let Some(event) =
-                    pipeline.announce_interruptible("Connection failed. Retrying.", Some(rx))
-                {
-                    info!("Interrupted during retry announcement");
-                    return Some(event);
-                }
-            } else {
-                info!(
-                    "Silent retry {} of {} for {}",
-                    retry_count, RECONNECT_SILENT_RETRIES, channel.name
-                );
-            }
+            info!(
+                "Silent reconnect {} of {} for {}",
+                retry_count, RECONNECT_SILENT_RETRIES, channel.name
+            );
         }
 
-        // Wait before retry with exponential backoff, checking for interrupts
-        info!("Waiting {}s before reconnect attempt", retry_interval);
+        // Wait before retry, checking for button interrupts
         let wait_until = std::time::Instant::now() + std::time::Duration::from_secs(retry_interval);
-
         while std::time::Instant::now() < wait_until {
-            if let Ok(event) = rx.try_recv() {
-                info!("Interrupted during reconnect wait");
-                return Some(event);
+            if let Ok(ButtonEvent::Down) = rx.try_recv() {
+                return; // interrupted
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
 
-        // Exponential backoff: double the interval, cap at max
+        if pipeline.connect_and_play(channel.url) {
+            info!("Reconnected to {}", channel.name);
+            return;
+        }
+
         retry_interval = (retry_interval * 2).min(RECONNECT_MAX_SECS);
     }
 }
@@ -522,8 +562,6 @@ fn handle_welcome(pipeline: &mut audio::AudioPipeline) {
             pipeline.announce("Up to date.");
         }
     }
-
-    pipeline.announce("Ready.");
 }
 
 fn test_tts() -> Result<()> {
@@ -699,60 +737,218 @@ fn uninstall_service() -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_state_welcome_to_playing() {
-        let state = RadioState::Welcome;
-        assert_eq!(state.next(4), RadioState::Playing(0));
-    }
+    const N: usize = 4; // test with 4 channels
+
+    // ==================== Short press: Playing → Browsing ====================
 
     #[test]
-    fn test_state_playing_next_channel() {
+    fn test_playing_short_press_enters_browsing() {
         let state = RadioState::Playing(0);
-        assert_eq!(state.next(4), RadioState::Playing(1));
-
-        let state = RadioState::Playing(2);
-        assert_eq!(state.next(4), RadioState::Playing(3));
+        assert_eq!(
+            state.short_press(N),
+            RadioState::Browsing {
+                playing: Some(0),
+                browse: 1
+            }
+        );
     }
 
     #[test]
-    fn test_state_playing_last_to_off() {
+    fn test_playing_last_channel_short_press_wraps_to_zero() {
         let state = RadioState::Playing(3);
-        assert_eq!(state.next(4), RadioState::Off);
+        assert_eq!(
+            state.short_press(N),
+            RadioState::Browsing {
+                playing: Some(3),
+                browse: 0
+            }
+        );
+    }
+
+    // ==================== Short press: Browsing advances ====================
+
+    #[test]
+    fn test_browsing_short_press_advances() {
+        let state = RadioState::Browsing {
+            playing: Some(0),
+            browse: 1,
+        };
+        assert_eq!(
+            state.short_press(N),
+            RadioState::Browsing {
+                playing: Some(0),
+                browse: 2
+            }
+        );
     }
 
     #[test]
-    fn test_state_off_to_welcome() {
+    fn test_browsing_short_press_wraps_around() {
+        let state = RadioState::Browsing {
+            playing: Some(0),
+            browse: 3,
+        };
+        assert_eq!(
+            state.short_press(N),
+            RadioState::Browsing {
+                playing: Some(0),
+                browse: 0
+            }
+        );
+    }
+
+    #[test]
+    fn test_browsing_preserves_playing_channel() {
+        // Playing channel 2, browsing through channels
+        let mut state = RadioState::Browsing {
+            playing: Some(2),
+            browse: 0,
+        };
+        state = state.short_press(N); // browse → 1
+        state = state.short_press(N); // browse → 2
+        state = state.short_press(N); // browse → 3
+        assert_eq!(
+            state,
+            RadioState::Browsing {
+                playing: Some(2),
+                browse: 3
+            }
+        );
+    }
+
+    // ==================== Short press: Off → Browsing ====================
+
+    #[test]
+    fn test_off_short_press_enters_browsing_at_zero() {
         let state = RadioState::Off;
-        assert_eq!(state.next(4), RadioState::Welcome);
+        assert_eq!(
+            state.short_press(N),
+            RadioState::Browsing {
+                playing: None,
+                browse: 0
+            }
+        );
+    }
+
+    // ==================== Commit ====================
+
+    #[test]
+    fn test_commit_switches_to_playing() {
+        let state = RadioState::Browsing {
+            playing: Some(0),
+            browse: 2,
+        };
+        assert_eq!(state.commit(), RadioState::Playing(2));
     }
 
     #[test]
-    fn test_state_full_cycle() {
-        let mut state = RadioState::Welcome;
-        let n = 4;
+    fn test_commit_same_channel_stays_playing() {
+        let state = RadioState::Browsing {
+            playing: Some(1),
+            browse: 1,
+        };
+        assert_eq!(state.commit(), RadioState::Playing(1));
+    }
 
-        state = state.next(n); // -> Playing(0)
-        assert_eq!(state, RadioState::Playing(0));
+    #[test]
+    fn test_commit_from_off_starts_playing() {
+        let state = RadioState::Browsing {
+            playing: None,
+            browse: 3,
+        };
+        assert_eq!(state.commit(), RadioState::Playing(3));
+    }
 
-        state = state.next(n); // -> Playing(1)
-        state = state.next(n); // -> Playing(2)
-        state = state.next(n); // -> Playing(3)
-        assert_eq!(state, RadioState::Playing(3));
+    #[test]
+    fn test_commit_non_browsing_is_noop() {
+        assert_eq!(RadioState::Playing(0).commit(), RadioState::Playing(0));
+        assert_eq!(RadioState::Off.commit(), RadioState::Off);
+    }
 
-        state = state.next(n); // -> Off
+    // ==================== Long press ====================
+
+    #[test]
+    fn test_long_press_from_playing() {
+        assert_eq!(RadioState::Playing(2).long_press(), RadioState::Off);
+    }
+
+    #[test]
+    fn test_long_press_from_browsing() {
+        let state = RadioState::Browsing {
+            playing: Some(0),
+            browse: 2,
+        };
+        assert_eq!(state.long_press(), RadioState::Off);
+    }
+
+    #[test]
+    fn test_long_press_from_off() {
+        assert_eq!(RadioState::Off.long_press(), RadioState::Off);
+    }
+
+    // ==================== Full scenarios ====================
+
+    #[test]
+    fn test_scenario_browse_and_commit() {
+        // Playing ch0, browse to ch2, commit
+        let mut state = RadioState::Playing(0);
+        state = state.short_press(N); // Browsing { playing: 0, browse: 1 }
+        state = state.short_press(N); // Browsing { playing: 0, browse: 2 }
+        state = state.commit(); // Playing(2)
+        assert_eq!(state, RadioState::Playing(2));
+    }
+
+    #[test]
+    fn test_scenario_browse_full_circle_back_to_same() {
+        // Playing ch1, browse all the way around back to ch1, commit
+        let mut state = RadioState::Playing(1);
+        state = state.short_press(N); // browse: 2
+        state = state.short_press(N); // browse: 3
+        state = state.short_press(N); // browse: 0
+        state = state.short_press(N); // browse: 1 (back to playing)
+        assert_eq!(
+            state,
+            RadioState::Browsing {
+                playing: Some(1),
+                browse: 1
+            }
+        );
+        state = state.commit();
+        assert_eq!(state, RadioState::Playing(1)); // same channel
+    }
+
+    #[test]
+    fn test_scenario_off_browse_commit() {
+        // From Off, browse to ch2, commit
+        let mut state = RadioState::Off;
+        state = state.short_press(N); // Browsing { playing: None, browse: 0 }
+        state = state.short_press(N); // browse: 1
+        state = state.short_press(N); // browse: 2
+        state = state.commit();
+        assert_eq!(state, RadioState::Playing(2));
+    }
+
+    #[test]
+    fn test_scenario_browse_then_long_press() {
+        // Playing ch0, start browsing, then long press → Off
+        let mut state = RadioState::Playing(0);
+        state = state.short_press(N); // Browsing
+        state = state.short_press(N); // advance browse
+        state = state.long_press(); // Off
         assert_eq!(state, RadioState::Off);
-
-        state = state.next(n); // -> Welcome
-        assert_eq!(state, RadioState::Welcome);
     }
 
     #[test]
-    fn test_state_single_channel() {
-        // Edge case: only 1 channel
-        let state = RadioState::Welcome;
-        assert_eq!(state.next(1), RadioState::Playing(0));
-
+    fn test_scenario_single_channel_wraps() {
+        // Only 1 channel: browse wraps to itself
         let state = RadioState::Playing(0);
-        assert_eq!(state.next(1), RadioState::Off);
+        let state = state.short_press(1); // browse: (0+1)%1 = 0
+        assert_eq!(
+            state,
+            RadioState::Browsing {
+                playing: Some(0),
+                browse: 0
+            }
+        );
     }
 }

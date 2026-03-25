@@ -40,7 +40,11 @@ fn main() {
             // Not available during dummy dep-cache build
             let p = Path::new(&out_dir).join("tts_generated.rs");
             let mut f = fs::File::create(p).unwrap();
-            writeln!(f, "pub fn get_audio(_: &str) -> Option<&'static [u8]> {{ None }}").unwrap();
+            writeln!(
+                f,
+                "pub fn get_audio(_: &str) -> Option<&'static [u8]> {{ None }}"
+            )
+            .unwrap();
 
             let p = Path::new(&out_dir).join("channels_generated.rs");
             let mut f = fs::File::create(p).unwrap();
@@ -56,7 +60,11 @@ fn main() {
     let mut f = fs::File::create(tts_path).unwrap();
 
     writeln!(f, "/// Auto-generated from radio.toml — do not edit").unwrap();
-    writeln!(f, "pub fn get_audio(phrase: &str) -> Option<&'static [u8]> {{").unwrap();
+    writeln!(
+        f,
+        "pub fn get_audio(phrase: &str) -> Option<&'static [u8]> {{"
+    )
+    .unwrap();
     writeln!(f, "    match phrase {{").unwrap();
 
     for ch in &config.channels {

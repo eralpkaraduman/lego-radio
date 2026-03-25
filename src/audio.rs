@@ -22,7 +22,6 @@ const VOLUME: f32 = 1.0;
 const BEEP_VOLUME: f32 = 0.3;
 
 /// Ducked stream volume during browsing (used by upcoming browse state machine)
-#[allow(dead_code)]
 const DUCK_VOLUME: f32 = 0.2;
 
 // =============================================================================
@@ -46,6 +45,10 @@ pub struct AudioPipeline {
 
     /// Current stream thread (download + decode combined)
     stream_thread: Option<StreamHandle>,
+
+    /// Epoch counter — incremented on each new stream. Old threads compare
+    /// their epoch to this and stop writing if they don't match.
+    stream_epoch: Arc<std::sync::atomic::AtomicU64>,
 
     /// Keep OutputStream alive (audio stops if dropped)
     _stream: OutputStream,
@@ -104,19 +107,37 @@ impl AudioPipeline {
             voice_sink,
             beep_sink,
             stream_thread: None,
+            stream_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             _stream: stream,
         })
     }
 
-    /// Stop stream playback. Does NOT affect voice or beep sinks.
+    /// Stop stream playback with fade out.
+    /// Old thread is safe to abandon — epoch check prevents stale writes.
     pub fn stop_stream(&mut self) {
         if let Some(handle) = self.stream_thread.take() {
             handle.stop();
-            std::thread::spawn(move || {
-                handle.join();
-            });
+
+            // Fade out over 200ms
+            let steps = 10;
+            let start_vol = self.stream_sink.volume();
+            for i in 1..=steps {
+                let vol = start_vol * (1.0 - i as f32 / steps as f32);
+                self.stream_sink.set_volume(vol);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+
+            // Let thread die on its own — epoch prevents it from writing
+            std::thread::spawn(move || handle.join());
         }
+
+        // Skip + clear to flush any buffered audio from rodio's internal queue
+        self.stream_sink.skip_one();
         self.stream_sink.clear();
+        // Small delay to let rodio process the clear
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        self.stream_sink.clear();
+        self.stream_sink.set_volume(VOLUME);
         self.stream_sink.play();
     }
 
@@ -130,15 +151,28 @@ impl AudioPipeline {
     }
 
     /// Duck stream volume for browsing
-    #[allow(dead_code)]
     pub fn duck_stream(&self) {
         self.stream_sink.set_volume(DUCK_VOLUME);
     }
 
     /// Restore stream volume after browsing
-    #[allow(dead_code)]
     pub fn restore_stream(&self) {
         self.stream_sink.set_volume(VOLUME);
+    }
+
+    /// Fade stream in from silent to full volume (non-blocking, spawns thread)
+    pub fn fade_in_stream(&self) {
+        let sink = self.stream_sink.clone();
+        sink.set_volume(0.0);
+        std::thread::spawn(move || {
+            let steps = 15;
+            let step_ms = 20; // 300ms total
+            for i in 1..=steps {
+                let vol = VOLUME * (i as f32 / steps as f32);
+                sink.set_volume(vol);
+                std::thread::sleep(std::time::Duration::from_millis(step_ms));
+            }
+        });
     }
 
     /// Connect to a URL and start playing
@@ -151,17 +185,27 @@ impl AudioPipeline {
         // Stop any existing stream
         self.stop_stream();
 
+        // Bump epoch — any old abandoned threads will see the mismatch and stop writing
+        let epoch = self.stream_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_clone = stop_flag.clone();
         let sink = self.stream_sink.clone();
-        let url_string = url.to_string();
-        let url_for_thread = url_string.clone();
+        let epoch_ref = self.stream_epoch.clone();
+        let url_for_thread = url.to_string();
 
         // Channel to signal when connected
         let (connected_tx, connected_rx) = std::sync::mpsc::channel();
 
         let thread = thread::spawn(move || {
-            stream_loop(&url_for_thread, sink, stop_clone, connected_tx);
+            stream_loop(
+                &url_for_thread,
+                sink,
+                stop_clone,
+                connected_tx,
+                epoch,
+                epoch_ref,
+            );
         });
 
         self.stream_thread = Some(StreamHandle { thread, stop_flag });
@@ -172,7 +216,7 @@ impl AudioPipeline {
                 info!("Connected and playing");
                 sentry::add_breadcrumb(sentry::Breadcrumb {
                     category: Some("stream".into()),
-                    message: Some(format!("Connected to stream: {}", url_string)),
+                    message: Some(format!("Connected to stream: {}", url)),
                     level: sentry::Level::Info,
                     ..Default::default()
                 });
@@ -182,7 +226,7 @@ impl AudioPipeline {
                 warn!("Connection failed");
                 sentry::add_breadcrumb(sentry::Breadcrumb {
                     category: Some("stream".into()),
-                    message: Some(format!("Connection failed: {}", url_string)),
+                    message: Some(format!("Connection failed: {}", url)),
                     level: sentry::Level::Warning,
                     ..Default::default()
                 });
@@ -193,7 +237,7 @@ impl AudioPipeline {
                 warn!("Connection timed out");
                 sentry::add_breadcrumb(sentry::Breadcrumb {
                     category: Some("stream".into()),
-                    message: Some(format!("Connection timeout: {}", url_string)),
+                    message: Some(format!("Connection timeout: {}", url)),
                     level: sentry::Level::Warning,
                     ..Default::default()
                 });
@@ -258,38 +302,25 @@ impl AudioPipeline {
         self.beep_sink.sleep_until_end();
     }
 
-    /// Play a short confirmation tune (ascending two-note chirp)
-    /// Blocking - waits for tune to finish
+    /// Short blip on button release (1320Hz, distinct from 880Hz hold beep)
+    /// Blocking - waits for blip to finish
     pub fn confirm_beep(&self) {
         let sample_rate = 44100u32;
-        let note_ms = 60;
-        let gap_ms = 20;
-        let freq1 = 880.0f32;
-        let freq2 = 1108.73f32;
+        let note_ms = 80;
+        let frequency = 1320.0f32; // E6 — distinct from 880Hz hold beep
+        let num_samples = (sample_rate as usize * note_ms) / 1000;
 
-        let note_samples = (sample_rate as usize * note_ms) / 1000;
-        let gap_samples = (sample_rate as usize * gap_ms) / 1000;
-        let total_samples = note_samples * 2 + gap_samples;
-
-        let samples: Vec<f32> = (0..total_samples)
+        let samples: Vec<f32> = (0..num_samples)
             .map(|i| {
-                let (frequency, local_i, local_len) = if i < note_samples {
-                    (freq1, i, note_samples)
-                } else if i < note_samples + gap_samples {
-                    return 0.0;
-                } else {
-                    (freq2, i - note_samples - gap_samples, note_samples)
-                };
-
-                let t = local_i as f32 / sample_rate as f32;
-                let envelope = if local_i < local_len / 8 {
-                    local_i as f32 / (local_len / 8) as f32
-                } else if local_i > local_len * 7 / 8 {
-                    (local_len - local_i) as f32 / (local_len / 8) as f32
+                let t = i as f32 / sample_rate as f32;
+                // Quick fade in/out envelope
+                let envelope = if i < num_samples / 6 {
+                    i as f32 / (num_samples / 6) as f32
+                } else if i > num_samples * 5 / 6 {
+                    (num_samples - i) as f32 / (num_samples / 6) as f32
                 } else {
                     1.0
                 };
-
                 (t * frequency * 2.0 * std::f32::consts::PI).sin() * envelope
             })
             .collect();
@@ -353,14 +384,41 @@ impl AudioPipeline {
         self.announce_interruptible(text, None);
     }
 
+    /// Start TTS playback without waiting (non-blocking).
+    /// Use `is_voice_playing()` to check if still playing.
+    /// Use `stop_voice()` to interrupt.
+    pub fn speak(&self, text: &str) {
+        info!("TTS (async): {}", text);
+
+        let raw = match crate::tts::get_audio(text) {
+            Some(data) => data,
+            None => {
+                warn!("No pre-generated audio for: {}", text);
+                return;
+            }
+        };
+
+        let samples_f32 = crate::tts::pcm_to_f32(raw);
+        if samples_f32.is_empty() {
+            return;
+        }
+
+        self.voice_sink.clear();
+        let gap = vec![0.0f32; (crate::tts::SAMPLE_RATE as usize) / 2];
+        self.voice_sink
+            .append(SamplesBuffer::new(1, crate::tts::SAMPLE_RATE, gap));
+
+        let source = SamplesBuffer::new(1, crate::tts::SAMPLE_RATE, samples_f32);
+        self.voice_sink.append(source);
+        self.voice_sink.play();
+    }
+
     /// Check if voice sink is still playing
-    #[allow(dead_code)]
     pub fn is_voice_playing(&self) -> bool {
         !self.voice_sink.empty()
     }
 
     /// Stop voice playback immediately
-    #[allow(dead_code)]
     pub fn stop_voice(&self) {
         self.voice_sink.clear();
     }
@@ -379,6 +437,8 @@ fn stream_loop(
     sink: Arc<Sink>,
     stop_flag: Arc<AtomicBool>,
     connected_tx: std::sync::mpsc::Sender<bool>,
+    my_epoch: u64,
+    current_epoch: Arc<std::sync::atomic::AtomicU64>,
 ) {
     debug!("Starting stream from: {}", url);
 
@@ -522,6 +582,13 @@ fn stream_loop(
 
         let samples = sample_buf.samples().to_vec();
 
+        // Check stop flag and epoch before writing — if epoch changed,
+        // a new stream has started and we must not write stale audio
+        if stop_flag.load(Ordering::SeqCst) || current_epoch.load(Ordering::SeqCst) != my_epoch {
+            debug!("Stream thread stopping (epoch mismatch or stop flag)");
+            break;
+        }
+
         // Play through rodio
         let source = SamplesBuffer::new(channels as u16, sample_rate, samples);
         sink.append(source);
@@ -531,6 +598,14 @@ fn stream_loop(
             sink.play();
         }
         packet_count += 1;
+
+        // Periodic log every 100 packets so we can see which stream is writing
+        if packet_count % 100 == 0 {
+            debug!(
+                "Stream [epoch={}] writing packet {}: {}",
+                my_epoch, packet_count, url
+            );
+        }
     }
 
     debug!("Stream loop ended");
@@ -682,7 +757,10 @@ impl HlsReader {
         }
 
         let segment_url = self.pending_segments.pop_front().unwrap();
-        debug!("HLS: fetching segment (seq {})", self.next_media_sequence - self.pending_segments.len() as u64 - 1);
+        debug!(
+            "HLS: fetching segment (seq {})",
+            self.next_media_sequence - self.pending_segments.len() as u64 - 1
+        );
 
         let response = ureq::get(&segment_url)
             .set("User-Agent", "lego-radio/1.0")

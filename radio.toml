@@ -127,11 +127,6 @@ voice = "en_GB-alan-medium"
 file = "up_to_date"
 
 [[ui]]
-text = "Ready."
-voice = "en_GB-alan-medium"
-file = "ready"
-
-[[ui]]
 text = "Connection lost. Reconnecting."
 voice = "en_GB-alan-medium"
 file = "connection_lost_reconnecting"

@@ -125,13 +125,20 @@ mod gui_button {
         }
 
         fn draw(app: &mut App) {
-            let surface = match &mut app.surface {
-                Some(s) => s,
-                None => return,
+            let (surface, window) = match (&mut app.surface, &app.window) {
+                (Some(s), Some(w)) => (s, w),
+                _ => return,
             };
 
-            let w = app.win_w;
-            let h = app.win_h;
+            // Get physical pixel size (accounts for Retina/HiDPI)
+            let scale = window.scale_factor();
+            let phys = window.inner_size();
+            let w = phys.width;
+            let h = phys.height;
+
+            if w == 0 || h == 0 {
+                return;
+            }
 
             surface
                 .resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap())
@@ -151,34 +158,44 @@ mod gui_button {
                 load_sprite(SPRITE_UP)
             };
 
-            // Center sprite in window
-            let ox = (w.saturating_sub(sw)) / 2;
-            let oy = (h.saturating_sub(sh)) / 2;
+            // Scale sprite to match physical pixels
+            let scaled_w = (app.sprite_w as f64 * scale) as u32;
+            let scaled_h = (app.sprite_h as f64 * scale) as u32;
+
+            // Center in window
+            let ox = (w.saturating_sub(scaled_w)) / 2;
+            let oy = (h.saturating_sub(scaled_h)) / 2;
 
             // The sprite is black pixels with varying alpha (shadow overlay).
-            // Render: fill a red circle, then composite sprite as shadow on top.
+            // Render: fill a red ellipse, then composite scaled sprite on top.
             let base_r: u32 = 200;
             let base_g: u32 = 30;
             let base_b: u32 = 30;
 
             // First pass: fill ellipse with base red color
-            let cx = ox + sw / 2;
-            let cy = oy + sh / 2;
-            let rx = (sw / 2) as i32;
-            let ry = (sh / 2) as i32;
+            let cx = ox + scaled_w / 2;
+            let cy = oy + scaled_h / 2;
+            let rx = (scaled_w / 2) as i32;
+            let ry = (scaled_h / 2) as i32;
             for py in 0..h {
                 for px in 0..w {
-                    let dx = px as i32 - cx as i32;
-                    let dy = py as i32 - cy as i32;
-                    if dx * dx * ry * ry + dy * dy * rx * rx <= rx * rx * ry * ry {
+                    let ddx = px as i32 - cx as i32;
+                    let ddy = py as i32 - cy as i32;
+                    if ddx * ddx * ry * ry + ddy * ddy * rx * rx <= rx * rx * ry * ry {
                         buf[(py * w + px) as usize] = (base_r << 16) | (base_g << 8) | base_b;
                     }
                 }
             }
 
-            // Second pass: composite sprite (black + alpha) as shadow/detail
-            for sy in 0..sh {
-                for sx in 0..sw {
+            // Second pass: composite sprite scaled to physical pixels (nearest neighbor)
+            for py in 0..scaled_h {
+                for px in 0..scaled_w {
+                    // Map back to sprite coordinates
+                    let sx = (px as f64 / scale) as u32;
+                    let sy = (py as f64 / scale) as u32;
+                    let sx = sx.min(sw - 1);
+                    let sy = sy.min(sh - 1);
+
                     let src_idx = ((sy * sw + sx) * 4) as usize;
                     if src_idx + 3 >= pixels.len() {
                         continue;
@@ -192,8 +209,8 @@ mod gui_button {
                         continue;
                     }
 
-                    let dx = ox + sx;
-                    let dy = oy + sy;
+                    let dx = ox + px;
+                    let dy = oy + py;
                     if dx >= w || dy >= h {
                         continue;
                     }
@@ -223,7 +240,8 @@ mod gui_button {
                             self.win_w as f64,
                             self.win_h as f64,
                         ))
-                        .with_resizable(false);
+                        .with_resizable(false)
+                        .with_window_level(winit::window::WindowLevel::AlwaysOnTop);
                     match event_loop.create_window(attrs) {
                         Ok(w) => {
                             let w = std::rc::Rc::new(w);
@@ -253,17 +271,8 @@ mod gui_button {
                         button: MouseButton::Left,
                         ..
                     } => {
-                        // Hit test: check if cursor is within button sprite ellipse
-                        let cx = self.win_w as f64 / 2.0;
-                        let cy = self.win_h as f64 / 2.0;
-                        let rx = self.sprite_w as f64 / 2.0;
-                        let ry = self.sprite_h as f64 / 2.0;
-                        let dx = self.cursor_x - cx;
-                        let dy = self.cursor_y - cy;
-                        let in_button = (dx * dx) / (rx * rx) + (dy * dy) / (ry * ry) <= 1.0;
-
                         match state {
-                            ElementState::Pressed if in_button => {
+                            ElementState::Pressed => {
                                 info!("GUI: Button pressed");
                                 self.pressed.store(true, Ordering::SeqCst);
                                 self.is_down = true;

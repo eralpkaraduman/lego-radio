@@ -58,7 +58,7 @@ mod tests {
 
     #[test]
     fn test_audio_data_not_empty() {
-        for phrase in ["Hello!", "Ready.", "Radio off", "Off"] {
+        for phrase in ["Hello!", "Radio off", "Off"] {
             let audio = get_audio(phrase).unwrap();
             assert!(!audio.is_empty(), "Audio for '{}' is empty", phrase);
             assert!(
