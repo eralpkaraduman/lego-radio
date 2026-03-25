@@ -375,12 +375,10 @@ fn handle_button_press(
 
     if final_event == ButtonEvent::Long {
         // Wait for button release — consume events until quiet for 300ms
-        loop {
-            match rx.recv_timeout(std::time::Duration::from_millis(300)) {
-                Ok(_) => continue, // still getting events, button still held
-                Err(_) => break,   // no events for 300ms, button released
-            }
-        }
+        while rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_ok()
+        {}
     } else {
         pipeline.confirm_beep();
     }
