@@ -18,23 +18,31 @@ use symphonia::core::probe::Hint;
 /// Playback volume (0.0 to 1.0)
 const VOLUME: f32 = 1.0;
 
-/// Beep volume relative to main volume
+/// Beep volume
 const BEEP_VOLUME: f32 = 0.3;
+
+/// Ducked stream volume during browsing (used by upcoming browse state machine)
+#[allow(dead_code)]
+const DUCK_VOLUME: f32 = 0.2;
 
 // =============================================================================
 // AudioPipeline - Simple connect-on-demand audio streaming
 // =============================================================================
 
-/// Simple audio pipeline that connects to one stream at a time.
+/// Audio pipeline with three independent sinks.
 ///
-/// Key properties:
-/// - Connect on demand (no pre-buffering)
-/// - One stream at a time
-/// - Interruptible (stop clears everything immediately)
-/// - TTS plays through same sink
+/// - **stream_sink**: Radio stream playback, volume duckable
+/// - **voice_sink**: TTS announcements, interruptible
+/// - **beep_sink**: Beeps, chirps, confirmation tunes — never interrupted
+///
+/// All three share one OutputStream and can play simultaneously.
 pub struct AudioPipeline {
-    /// Single audio output sink
-    sink: Arc<Sink>,
+    /// Radio stream playback (duckable)
+    stream_sink: Arc<Sink>,
+    /// TTS voice announcements (interruptible)
+    voice_sink: Sink,
+    /// Beeps and confirmation tunes
+    beep_sink: Sink,
 
     /// Current stream thread (download + decode combined)
     stream_thread: Option<StreamHandle>,
@@ -64,17 +72,26 @@ impl StreamHandle {
 }
 
 impl AudioPipeline {
-    /// Create a new audio pipeline
+    /// Create a new audio pipeline with three independent sinks
     pub fn new() -> Result<Self> {
         let (stream, stream_handle) = OutputStream::try_default()
             .map_err(|e| anyhow!("Failed to open audio output: {}", e))?;
 
-        let sink = Arc::new(
-            Sink::try_new(&stream_handle).map_err(|e| anyhow!("Failed to create sink: {}", e))?,
+        let stream_sink = Arc::new(
+            Sink::try_new(&stream_handle)
+                .map_err(|e| anyhow!("Failed to create stream sink: {}", e))?,
         );
-        sink.set_volume(VOLUME);
+        stream_sink.set_volume(VOLUME);
 
-        info!("Audio pipeline initialized");
+        let voice_sink = Sink::try_new(&stream_handle)
+            .map_err(|e| anyhow!("Failed to create voice sink: {}", e))?;
+        voice_sink.set_volume(VOLUME);
+
+        let beep_sink = Sink::try_new(&stream_handle)
+            .map_err(|e| anyhow!("Failed to create beep sink: {}", e))?;
+        beep_sink.set_volume(BEEP_VOLUME);
+
+        info!("Audio pipeline initialized (3 sinks)");
         sentry::add_breadcrumb(sentry::Breadcrumb {
             category: Some("audio".into()),
             message: Some("Audio pipeline initialized".into()),
@@ -83,29 +100,45 @@ impl AudioPipeline {
         });
 
         Ok(Self {
-            sink,
+            stream_sink,
+            voice_sink,
+            beep_sink,
             stream_thread: None,
             _stream: stream,
         })
     }
 
-    /// Stop all playback immediately
-    ///
-    /// Signals stream thread to stop, clears sink. Does NOT wait for thread.
-    pub fn stop(&mut self) {
-        // Signal stream thread to stop (don't wait - HTTP might be blocking)
+    /// Stop stream playback. Does NOT affect voice or beep sinks.
+    pub fn stop_stream(&mut self) {
         if let Some(handle) = self.stream_thread.take() {
             handle.stop();
-            // Don't join - let thread die on its own
-            // Spawn a cleanup thread to join it later
             std::thread::spawn(move || {
                 handle.join();
             });
         }
+        self.stream_sink.clear();
+        self.stream_sink.play();
+    }
 
-        // Clear any queued audio immediately
-        self.sink.clear();
-        self.sink.play(); // Reset paused state if any
+    /// Stop all playback immediately (stream + voice + beep)
+    pub fn stop(&mut self) {
+        self.stop_stream();
+        self.voice_sink.clear();
+        self.voice_sink.play();
+        self.beep_sink.clear();
+        self.beep_sink.play();
+    }
+
+    /// Duck stream volume for browsing
+    #[allow(dead_code)]
+    pub fn duck_stream(&self) {
+        self.stream_sink.set_volume(DUCK_VOLUME);
+    }
+
+    /// Restore stream volume after browsing
+    #[allow(dead_code)]
+    pub fn restore_stream(&self) {
+        self.stream_sink.set_volume(VOLUME);
     }
 
     /// Connect to a URL and start playing
@@ -116,11 +149,11 @@ impl AudioPipeline {
         info!("Connecting to: {}", url);
 
         // Stop any existing stream
-        self.stop();
+        self.stop_stream();
 
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_clone = stop_flag.clone();
-        let sink = self.sink.clone();
+        let sink = self.stream_sink.clone();
         let url_string = url.to_string();
         let url_for_thread = url_string.clone();
 
@@ -179,66 +212,60 @@ impl AudioPipeline {
     }
 
     /// Start continuous beep (non-blocking) - plays until stop_beep is called
-    /// Generates a long tone that will be cut off when stop_beep is called
     pub fn start_beep(&self) {
-        // Generate a 5 second 880Hz sine wave (long enough for any button hold)
         let sample_rate = 44100u32;
-        let duration_ms = 5000; // 5 seconds max
+        let duration_ms = 5000;
         let frequency = 880.0f32;
         let num_samples = (sample_rate as usize * duration_ms) / 1000;
-
-        let fade_samples = sample_rate as usize / 20; // 50ms fade
+        let fade_samples = sample_rate as usize / 20;
 
         let samples: Vec<f32> = (0..num_samples)
             .map(|i| {
                 let t = i as f32 / sample_rate as f32;
                 let envelope = if i < fade_samples {
-                    // Fade in
                     i as f32 / fade_samples as f32
                 } else {
                     1.0
                 };
-                (t * frequency * 2.0 * std::f32::consts::PI).sin() * BEEP_VOLUME * envelope
+                (t * frequency * 2.0 * std::f32::consts::PI).sin() * envelope
             })
             .collect();
 
         let source = SamplesBuffer::new(1, sample_rate, samples);
-        self.sink.append(source);
-        self.sink.play();
+        self.beep_sink.append(source);
+        self.beep_sink.play();
     }
 
-    /// Stop the continuous beep with a quick fade-out to avoid click
+    /// Stop the continuous beep with a quick fade-out
     pub fn stop_beep(&self) {
-        // Generate a very short fade-out tone to avoid audio pop
         let sample_rate = 44100u32;
-        let fade_ms = 15; // 15ms fade-out
+        let fade_ms = 15;
         let frequency = 880.0f32;
         let num_samples = (sample_rate as usize * fade_ms) / 1000;
 
         let samples: Vec<f32> = (0..num_samples)
             .map(|i| {
                 let t = i as f32 / sample_rate as f32;
-                let envelope = 1.0 - (i as f32 / num_samples as f32); // Linear fade out
-                (t * frequency * 2.0 * std::f32::consts::PI).sin() * BEEP_VOLUME * envelope
+                let envelope = 1.0 - (i as f32 / num_samples as f32);
+                (t * frequency * 2.0 * std::f32::consts::PI).sin() * envelope
             })
             .collect();
 
-        // Clear and immediately play fade-out
-        self.sink.clear();
+        self.beep_sink.clear();
         let source = SamplesBuffer::new(1, sample_rate, samples);
-        self.sink.append(source);
-        self.sink.play();
-        self.sink.sleep_until_end();
+        self.beep_sink.append(source);
+        self.beep_sink.play();
+        self.beep_sink.sleep_until_end();
     }
 
-    /// Play a short confirmation tune for channel change (ascending two-note chirp)
+    /// Play a short confirmation tune (ascending two-note chirp)
     /// Blocking - waits for tune to finish
     pub fn confirm_beep(&self) {
         let sample_rate = 44100u32;
-        let note_ms = 60; // 60ms per note
-        let gap_ms = 20; // 20ms gap between notes
-        let freq1 = 880.0f32; // A5
-        let freq2 = 1108.73f32; // C#6 (major third up - happy sound)
+        let note_ms = 60;
+        let gap_ms = 20;
+        let freq1 = 880.0f32;
+        let freq2 = 1108.73f32;
 
         let note_samples = (sample_rate as usize * note_ms) / 1000;
         let gap_samples = (sample_rate as usize * gap_ms) / 1000;
@@ -246,78 +273,72 @@ impl AudioPipeline {
 
         let samples: Vec<f32> = (0..total_samples)
             .map(|i| {
-                // Determine which part we're in
                 let (frequency, local_i, local_len) = if i < note_samples {
-                    // First note
                     (freq1, i, note_samples)
                 } else if i < note_samples + gap_samples {
-                    // Gap (silence)
                     return 0.0;
                 } else {
-                    // Second note
                     (freq2, i - note_samples - gap_samples, note_samples)
                 };
 
                 let t = local_i as f32 / sample_rate as f32;
-
-                // Envelope with quick attack and decay
                 let envelope = if local_i < local_len / 8 {
-                    // Fast attack
                     local_i as f32 / (local_len / 8) as f32
                 } else if local_i > local_len * 7 / 8 {
-                    // Fast decay
                     (local_len - local_i) as f32 / (local_len / 8) as f32
                 } else {
                     1.0
                 };
 
-                (t * frequency * 2.0 * std::f32::consts::PI).sin() * BEEP_VOLUME * envelope
+                (t * frequency * 2.0 * std::f32::consts::PI).sin() * envelope
             })
             .collect();
 
         let source = SamplesBuffer::new(1, sample_rate, samples);
-        self.sink.append(source);
-        self.sink.play();
-        self.sink.sleep_until_end();
+        self.beep_sink.append(source);
+        self.beep_sink.play();
+        self.beep_sink.sleep_until_end();
     }
 
-    /// Play TTS announcement
+    /// Play TTS announcement on the voice sink.
     ///
-    /// Plays TTS through the sink. Returns None if completed, Some(event) if interrupted.
-    /// Pass a receiver to check for interrupts, or None for blocking playback.
+    /// Returns None if completed, Some(event) if interrupted by button press.
     pub fn announce_interruptible(
-        &mut self,
+        &self,
         text: &str,
-        tts: &crate::tts::PiperTts,
         interrupt_rx: Option<&std::sync::mpsc::Receiver<ButtonEvent>>,
     ) -> Option<ButtonEvent> {
         info!("TTS: {}", text);
 
-        // Synthesize
-        let samples = match tts.synthesize(text) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("TTS failed: {}", e);
+        let raw = match crate::tts::get_audio(text) {
+            Some(data) => data,
+            None => {
+                warn!("No pre-generated audio for: {}", text);
                 return None;
             }
         };
 
-        if samples.is_empty() {
+        let samples_f32 = crate::tts::pcm_to_f32(raw);
+        if samples_f32.is_empty() {
             return None;
         }
 
-        let samples_f32: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
-        let source = SamplesBuffer::new(1, 22050, samples_f32);
+        // Clear any previous voice and add a brief gap before speaking
+        self.voice_sink.clear();
+        let gap = vec![0.0f32; (crate::tts::SAMPLE_RATE as usize) / 2]; // 0.5s silence
+        self.voice_sink
+            .append(SamplesBuffer::new(1, crate::tts::SAMPLE_RATE, gap));
 
-        self.sink.append(source);
-        self.sink.play();
+        let source = SamplesBuffer::new(1, crate::tts::SAMPLE_RATE, samples_f32);
+        self.voice_sink.append(source);
+        self.voice_sink.play();
 
         // Wait for playback, checking for interrupts
-        while !self.sink.empty() {
+        while !self.voice_sink.empty() {
             if let Some(rx) = interrupt_rx {
                 if let Ok(event) = rx.try_recv() {
                     info!("TTS interrupted by {:?}", event);
-                    self.sink.clear();
+                    self.voice_sink.clear();
                     return Some(event);
                 }
             }
@@ -328,8 +349,20 @@ impl AudioPipeline {
     }
 
     /// Play TTS announcement (blocking, no interrupt check)
-    pub fn announce(&mut self, text: &str, tts: &crate::tts::PiperTts) {
-        self.announce_interruptible(text, tts, None);
+    pub fn announce(&self, text: &str) {
+        self.announce_interruptible(text, None);
+    }
+
+    /// Check if voice sink is still playing
+    #[allow(dead_code)]
+    pub fn is_voice_playing(&self) -> bool {
+        !self.voice_sink.empty()
+    }
+
+    /// Stop voice playback immediately
+    #[allow(dead_code)]
+    pub fn stop_voice(&self) {
+        self.voice_sink.clear();
     }
 }
 
@@ -507,7 +540,10 @@ fn stream_loop(
 // HlsReader - Reads HLS streams by fetching segments sequentially
 // =============================================================================
 
-/// Reader that fetches HLS segments and presents them as a continuous stream
+/// Reader that fetches HLS segments and presents them as a continuous stream.
+///
+/// For live streams, the playlist is periodically refreshed to discover new segments.
+/// Tracks the next expected media sequence number to avoid re-fetching segments.
 struct HlsReader {
     /// Base URL for segments (playlist URL without filename)
     base_url: String,
@@ -515,19 +551,18 @@ struct HlsReader {
     playlist_url: String,
     /// Current segment data being read
     current_segment: Cursor<Vec<u8>>,
-    /// Queue of segment URLs to fetch
-    segment_queue: Vec<String>,
-    /// Index of next segment in queue
-    next_segment_idx: usize,
-    /// Last media sequence number seen (for live stream updates)
-    last_media_sequence: u64,
+    /// Pending segment URLs to fetch (only new/unseen segments)
+    pending_segments: std::collections::VecDeque<String>,
+    /// Next media sequence number we expect (to skip already-played segments on refresh)
+    next_media_sequence: u64,
+    /// Target duration of each segment (seconds), used for refresh timing
+    target_duration: f64,
     /// Stop flag to check
     stop_flag: Arc<AtomicBool>,
 }
 
 impl HlsReader {
     fn new(url: &str, stop_flag: Arc<AtomicBool>) -> Result<Self, std::io::Error> {
-        // Extract base URL (everything up to last /)
         let base_url = url
             .rsplit_once('/')
             .map(|(base, _)| format!("{}/", base))
@@ -537,9 +572,9 @@ impl HlsReader {
             base_url,
             playlist_url: url.to_string(),
             current_segment: Cursor::new(Vec::new()),
-            segment_queue: Vec::new(),
-            next_segment_idx: 0,
-            last_media_sequence: 0,
+            pending_segments: std::collections::VecDeque::new(),
+            next_media_sequence: 0,
+            target_duration: 6.0,
             stop_flag,
         };
 
@@ -552,9 +587,9 @@ impl HlsReader {
         Ok(reader)
     }
 
-    /// Refresh playlist and add new segments to queue
+    /// Refresh playlist and enqueue only new (unseen) segments
     fn refresh_playlist(&mut self) -> Result<(), std::io::Error> {
-        debug!("Fetching HLS playlist: {}", self.playlist_url);
+        debug!("HLS: refreshing playlist: {}", self.playlist_url);
 
         let response = ureq::get(&self.playlist_url)
             .set("User-Agent", "lego-radio/1.0")
@@ -564,7 +599,6 @@ impl HlsReader {
         let mut body = String::new();
         response.into_reader().read_to_string(&mut body)?;
 
-        // Parse playlist using m3u8-rs
         let parsed = m3u8_rs::parse_playlist_res(body.as_bytes()).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{:?}", e))
         })?;
@@ -572,27 +606,32 @@ impl HlsReader {
         match parsed {
             m3u8_rs::Playlist::MediaPlaylist(playlist) => {
                 let media_sequence = playlist.media_sequence;
+                self.target_duration = playlist.target_duration as f64;
 
-                // Only add segments we haven't seen
-                if media_sequence > self.last_media_sequence || self.segment_queue.is_empty() {
-                    self.segment_queue.clear();
-                    self.next_segment_idx = 0;
-
-                    for segment in &playlist.segments {
-                        let segment_url = if segment.uri.starts_with("http") {
-                            segment.uri.clone()
-                        } else {
-                            format!("{}{}", self.base_url, segment.uri)
-                        };
-                        self.segment_queue.push(segment_url);
+                // Each segment has a sequence number: media_sequence + index
+                // Only enqueue segments we haven't seen yet
+                for (i, segment) in playlist.segments.iter().enumerate() {
+                    let seq = media_sequence + i as u64;
+                    if seq < self.next_media_sequence {
+                        continue; // Already played this segment
                     }
 
-                    self.last_media_sequence = media_sequence;
-                    debug!("HLS: loaded {} segments", self.segment_queue.len());
+                    let segment_url = if segment.uri.starts_with("http") {
+                        segment.uri.clone()
+                    } else {
+                        format!("{}{}", self.base_url, segment.uri)
+                    };
+                    self.pending_segments.push_back(segment_url);
+                    self.next_media_sequence = seq + 1;
                 }
+
+                debug!(
+                    "HLS: playlist seq={}, {} new segments queued",
+                    media_sequence,
+                    self.pending_segments.len()
+                );
             }
             m3u8_rs::Playlist::MasterPlaylist(master) => {
-                // Master playlist - pick first variant
                 if let Some(variant) = master.variants.first() {
                     let variant_url = if variant.uri.starts_with("http") {
                         variant.uri.clone()
@@ -619,25 +658,33 @@ impl HlsReader {
 
     /// Fetch the next segment into current_segment buffer
     fn fetch_next_segment(&mut self) -> Result<(), std::io::Error> {
-        // Check if we need to refresh playlist (live stream)
-        if self.next_segment_idx >= self.segment_queue.len() {
-            // Give the server a moment before refreshing
-            std::thread::sleep(Duration::from_millis(500));
+        // If no pending segments, refresh the playlist
+        if self.pending_segments.is_empty() {
+            // Wait ~half the target duration before refreshing (HLS best practice)
+            let wait_ms = (self.target_duration * 500.0) as u64;
+            debug!("HLS: no segments, waiting {}ms before refresh", wait_ms);
+            std::thread::sleep(Duration::from_millis(wait_ms.max(500)));
+
             self.refresh_playlist()?;
 
-            // If still no segments, we're done
-            if self.next_segment_idx >= self.segment_queue.len() {
+            // Still nothing? Wait again and retry once more
+            if self.pending_segments.is_empty() {
+                std::thread::sleep(Duration::from_millis(wait_ms.max(500)));
+                self.refresh_playlist()?;
+            }
+
+            if self.pending_segments.is_empty() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
-                    "No more segments",
+                    "No more segments after refresh",
                 ));
             }
         }
 
-        let segment_url = &self.segment_queue[self.next_segment_idx];
-        debug!("HLS: fetching segment {}", self.next_segment_idx);
+        let segment_url = self.pending_segments.pop_front().unwrap();
+        debug!("HLS: fetching segment (seq {})", self.next_media_sequence - self.pending_segments.len() as u64 - 1);
 
-        let response = ureq::get(segment_url)
+        let response = ureq::get(&segment_url)
             .set("User-Agent", "lego-radio/1.0")
             .call()
             .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -650,13 +697,10 @@ impl HlsReader {
             debug!("HLS: demuxing TS segment ({} bytes)", data.len());
             demux_ts_audio(&data)
         } else {
-            // Not TS, use raw data (might be raw AAC)
             data
         };
 
         self.current_segment = Cursor::new(audio_data);
-        self.next_segment_idx += 1;
-
         Ok(())
     }
 }

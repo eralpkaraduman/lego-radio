@@ -1,6 +1,4 @@
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use log::info;
-use std::time::Duration;
 
 /// Button events sent to main thread
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +15,7 @@ pub enum ButtonEvent {
 pub const LONG_PRESS_MS: u64 = 2000;
 
 /// Trait for button input abstraction
+#[allow(dead_code)]
 pub trait ButtonInput: Send + Sync {
     /// Wait for button press and send events through the channel
     /// Sends ButtonEvent::Down immediately when pressed,
@@ -26,7 +25,6 @@ pub trait ButtonInput: Send + Sync {
 }
 
 /// Pin level for GPIO (matches rppal::gpio::Level)
-/// Also used for keyboard simulation (High = not pressed, Low = pressed)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinLevel {
     Low,
@@ -52,93 +50,290 @@ impl Default for ButtonConfig {
     }
 }
 
-/// Keyboard pin reader - tracks actual key held state
-/// Reports Low while Enter/Space is held, High when released
-/// Behaves exactly like a physical button - no shortcuts
-pub struct KeyboardPinReader {
-    /// True while the button key (Enter/Space) is held down
-    held: std::sync::atomic::AtomicBool,
-}
+// =============================================================================
+// GUI Button (macOS/desktop) - uses winit for proper press/release events
+// =============================================================================
 
-impl KeyboardPinReader {
-    pub fn new() -> Self {
-        Self {
-            held: std::sync::atomic::AtomicBool::new(false),
+#[cfg(not(target_os = "linux"))]
+mod gui_button {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    /// Pin reader backed by a GUI window button.
+    /// Mouse down on window → Low (pressed), mouse up → High (released).
+    pub struct GuiPinReader {
+        pressed: Arc<AtomicBool>,
+    }
+
+    impl PinReader for GuiPinReader {
+        fn read(&self) -> PinLevel {
+            if self.pressed.load(Ordering::SeqCst) {
+                PinLevel::Low
+            } else {
+                PinLevel::High
+            }
         }
     }
-}
 
-impl PinReader for KeyboardPinReader {
-    fn read(&self) -> PinLevel {
-        use std::sync::atomic::Ordering;
+    /// Create a GuiPinReader and return it along with the shared pressed state.
+    /// The caller must run `run_gui_window(pressed)` on the main thread.
+    pub fn create_gui_pin_reader() -> (GuiPinReader, Arc<AtomicBool>) {
+        let pressed = Arc::new(AtomicBool::new(false));
+        let reader = GuiPinReader {
+            pressed: pressed.clone(),
+        };
+        (reader, pressed)
+    }
 
-        // Poll for keyboard events (non-blocking)
-        if event::poll(Duration::from_millis(1)).unwrap_or(false) {
-            if let Ok(Event::Key(key_event)) = event::read() {
-                // Only handle Enter or Space as the "button"
-                let is_button_key = matches!(key_event.code, KeyCode::Enter | KeyCode::Char(' '));
+    // Embedded button sprites (104x99 RGBA, converted from PNG at build prep time)
+    // Format: first 8 bytes = width(u32 LE) + height(u32 LE), rest = RGBA pixels
+    const SPRITE_UP: &[u8] = include_bytes!("../assets/button_up.rgba");
+    const SPRITE_DOWN: &[u8] = include_bytes!("../assets/button_down.rgba");
 
-                if is_button_key {
-                    match key_event.kind {
-                        KeyEventKind::Press => {
-                            info!("Input: Button key pressed");
-                            self.held.store(true, Ordering::SeqCst);
-                        }
-                        KeyEventKind::Release => {
-                            info!("Input: Button key released");
-                            self.held.store(false, Ordering::SeqCst);
-                        }
-                        KeyEventKind::Repeat => {
-                            // Key is being held - keep state as Low
-                        }
+    fn load_sprite(data: &[u8]) -> (u32, u32, &[u8]) {
+        let w = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let h = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        (w, h, &data[8..])
+    }
+
+    /// Run the GUI event loop. Must be called on the main thread (macOS requirement).
+    /// Blocks forever.
+    pub fn run_gui_window(pressed: Arc<AtomicBool>) {
+        use softbuffer::Surface;
+        use std::num::NonZeroU32;
+        use winit::application::ApplicationHandler;
+        use winit::event::{ElementState, MouseButton, WindowEvent};
+        use winit::event_loop::{ActiveEventLoop, EventLoop};
+        use winit::window::{Window, WindowAttributes, WindowId};
+
+        let (sprite_w, sprite_h, _) = load_sprite(SPRITE_UP);
+
+        const BG: u32 = 0xFF_2D2D2D;
+
+        struct App {
+            pressed: Arc<AtomicBool>,
+            window: Option<std::rc::Rc<Window>>,
+            surface: Option<Surface<std::rc::Rc<Window>, std::rc::Rc<Window>>>,
+            is_down: bool,
+            win_w: u32,
+            win_h: u32,
+            sprite_w: u32,
+            sprite_h: u32,
+            cursor_x: f64,
+            cursor_y: f64,
+        }
+
+        fn draw(app: &mut App) {
+            let surface = match &mut app.surface {
+                Some(s) => s,
+                None => return,
+            };
+
+            let w = app.win_w;
+            let h = app.win_h;
+
+            surface
+                .resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap())
+                .unwrap();
+
+            let mut buf = surface.buffer_mut().unwrap();
+
+            // Fill background
+            for pixel in buf.iter_mut() {
+                *pixel = BG;
+            }
+
+            // Pick sprite
+            let (sw, sh, pixels) = if app.is_down {
+                load_sprite(SPRITE_DOWN)
+            } else {
+                load_sprite(SPRITE_UP)
+            };
+
+            // Center sprite in window
+            let ox = (w.saturating_sub(sw)) / 2;
+            let oy = (h.saturating_sub(sh)) / 2;
+
+            // The sprite is black pixels with varying alpha (shadow overlay).
+            // Render: fill a red circle, then composite sprite as shadow on top.
+            let base_r: u32 = 200;
+            let base_g: u32 = 30;
+            let base_b: u32 = 30;
+
+            // First pass: fill ellipse with base red color
+            let cx = ox + sw / 2;
+            let cy = oy + sh / 2;
+            let rx = (sw / 2) as i32;
+            let ry = (sh / 2) as i32;
+            for py in 0..h {
+                for px in 0..w {
+                    let dx = px as i32 - cx as i32;
+                    let dy = py as i32 - cy as i32;
+                    if dx * dx * ry * ry + dy * dy * rx * rx <= rx * rx * ry * ry {
+                        buf[(py * w + px) as usize] = (base_r << 16) | (base_g << 8) | base_b;
                     }
                 }
+            }
 
-                // Ctrl+C to exit
-                if let KeyEvent {
-                    code: KeyCode::Char('c'),
-                    modifiers: KeyModifiers::CONTROL,
-                    ..
-                } = key_event
-                {
-                    std::process::exit(0);
+            // Second pass: composite sprite (black + alpha) as shadow/detail
+            for sy in 0..sh {
+                for sx in 0..sw {
+                    let src_idx = ((sy * sw + sx) * 4) as usize;
+                    if src_idx + 3 >= pixels.len() {
+                        continue;
+                    }
+                    let sr = pixels[src_idx] as u32;
+                    let sg = pixels[src_idx + 1] as u32;
+                    let sb = pixels[src_idx + 2] as u32;
+                    let a = pixels[src_idx + 3] as u32;
+
+                    if a == 0 {
+                        continue;
+                    }
+
+                    let dx = ox + sx;
+                    let dy = oy + sy;
+                    if dx >= w || dy >= h {
+                        continue;
+                    }
+
+                    let dst_idx = (dy * w + dx) as usize;
+                    let bg = buf[dst_idx];
+                    let bg_r = (bg >> 16) & 0xFF;
+                    let bg_g = (bg >> 8) & 0xFF;
+                    let bg_b = bg & 0xFF;
+                    let inv_a = 255 - a;
+                    let out_r = (sr * a + bg_r * inv_a) / 255;
+                    let out_g = (sg * a + bg_g * inv_a) / 255;
+                    let out_b = (sb * a + bg_b * inv_a) / 255;
+                    buf[dst_idx] = (out_r << 16) | (out_g << 8) | out_b;
+                }
+            }
+
+            buf.present().unwrap();
+        }
+
+        impl ApplicationHandler for App {
+            fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+                if self.window.is_none() {
+                    let attrs = WindowAttributes::default()
+                        .with_title("lego-radio")
+                        .with_inner_size(winit::dpi::LogicalSize::new(
+                            self.win_w as f64,
+                            self.win_h as f64,
+                        ))
+                        .with_resizable(false);
+                    match event_loop.create_window(attrs) {
+                        Ok(w) => {
+                            let w = std::rc::Rc::new(w);
+                            let ctx = softbuffer::Context::new(w.clone()).unwrap();
+                            let surface = Surface::new(&ctx, w.clone()).unwrap();
+                            self.window = Some(w);
+                            self.surface = Some(surface);
+                        }
+                        Err(e) => log::error!("Failed to create window: {}", e),
+                    }
+                }
+            }
+
+            fn window_event(
+                &mut self,
+                _event_loop: &ActiveEventLoop,
+                _window_id: WindowId,
+                event: WindowEvent,
+            ) {
+                match event {
+                    WindowEvent::CursorMoved { position, .. } => {
+                        self.cursor_x = position.x;
+                        self.cursor_y = position.y;
+                    }
+                    WindowEvent::MouseInput {
+                        state,
+                        button: MouseButton::Left,
+                        ..
+                    } => {
+                        // Hit test: check if cursor is within button sprite ellipse
+                        let cx = self.win_w as f64 / 2.0;
+                        let cy = self.win_h as f64 / 2.0;
+                        let rx = self.sprite_w as f64 / 2.0;
+                        let ry = self.sprite_h as f64 / 2.0;
+                        let dx = self.cursor_x - cx;
+                        let dy = self.cursor_y - cy;
+                        let in_button = (dx * dx) / (rx * rx) + (dy * dy) / (ry * ry) <= 1.0;
+
+                        match state {
+                            ElementState::Pressed if in_button => {
+                                info!("GUI: Button pressed");
+                                self.pressed.store(true, Ordering::SeqCst);
+                                self.is_down = true;
+                            }
+                            ElementState::Released if self.is_down => {
+                                info!("GUI: Button released");
+                                self.pressed.store(false, Ordering::SeqCst);
+                                self.is_down = false;
+                            }
+                            _ => {}
+                        }
+                        draw(self);
+                    }
+                    WindowEvent::RedrawRequested => {
+                        draw(self);
+                    }
+                    WindowEvent::CloseRequested => {
+                        std::process::exit(0);
+                    }
+                    _ => {}
                 }
             }
         }
 
-        // Return current held state
-        if self.held.load(Ordering::SeqCst) {
-            PinLevel::Low
-        } else {
-            PinLevel::High
+        // Window slightly larger than sprite for padding
+        let win_w = sprite_w + 40;
+        let win_h = sprite_h + 40;
+
+        let event_loop = EventLoop::new().expect("Failed to create event loop");
+        let mut app = App {
+            pressed,
+            window: None,
+            surface: None,
+            is_down: false,
+            win_w,
+            win_h,
+            sprite_w,
+            sprite_h,
+            cursor_x: 0.0,
+            cursor_y: 0.0,
+        };
+        event_loop.run_app(&mut app).expect("Event loop failed");
+    }
+
+    pub struct GuiButton {
+        inner: super::GenericGpioButton<GuiPinReader>,
+    }
+
+    impl GuiButton {
+        pub fn new(pin_reader: GuiPinReader) -> Self {
+            Self {
+                inner: super::GenericGpioButton::new(pin_reader, ButtonConfig::default()),
+            }
+        }
+    }
+
+    impl ButtonInput for GuiButton {
+        fn wait_for_press(&self, tx: &std::sync::mpsc::Sender<ButtonEvent>) {
+            self.inner.wait_for_press(tx)
+        }
+
+        fn is_gpio(&self) -> bool {
+            false
         }
     }
 }
 
-/// Keyboard-based button for testing on Mac/desktop
-/// Uses GenericGpioButton logic - behaves exactly like physical button
-/// Hold Enter/Space for 2+ seconds for long press, release earlier for short press
-pub struct KeyboardButton {
-    inner: GenericGpioButton<KeyboardPinReader>,
-}
-
-impl KeyboardButton {
-    pub fn new() -> Self {
-        Self {
-            inner: GenericGpioButton::new(KeyboardPinReader::new(), ButtonConfig::default()),
-        }
-    }
-}
-
-impl ButtonInput for KeyboardButton {
-    fn wait_for_press(&self, tx: &std::sync::mpsc::Sender<ButtonEvent>) {
-        self.inner.wait_for_press(tx)
-    }
-
-    fn is_gpio(&self) -> bool {
-        false
-    }
-}
+// =============================================================================
+// Generic GPIO Button (shared logic for GPIO and GUI)
+// =============================================================================
 
 /// Generic button that works with any PinReader implementation
 /// Immediate response behavior:
@@ -156,12 +351,6 @@ impl<P: PinReader> GenericGpioButton<P> {
         Self { pin, config }
     }
 
-    /// Wait for button press and send events through channel
-    ///
-    /// Sends events:
-    /// 1. ButtonEvent::Down - immediately when button pressed
-    /// 2. ButtonEvent::Short - if released before LONG_PRESS_MS
-    ///    OR ButtonEvent::Long - if held for LONG_PRESS_MS (immediate, don't wait for release)
     fn detect_press(&self, tx: &std::sync::mpsc::Sender<ButtonEvent>) {
         use std::thread;
         use std::time::{Duration, Instant};
@@ -186,18 +375,17 @@ impl<P: PinReader> GenericGpioButton<P> {
         loop {
             thread::sleep(poll);
 
-            // Check elapsed time first (cheaper than GPIO read)
             let elapsed = press_start.elapsed();
             let level = self.pin.read();
 
-            // Check if released before threshold (most common case)
+            // Released before threshold → Short
             if level == PinLevel::High {
                 info!("Button: Short press ({:.1}s)", elapsed.as_secs_f32());
                 let _ = tx.send(ButtonEvent::Short);
                 return;
             }
 
-            // Check if long press threshold reached while still held
+            // Held past threshold → Long (immediate)
             if elapsed >= long_press_threshold {
                 info!(
                     "Button: Long press ({:.1}s) - triggering immediately",
@@ -220,7 +408,10 @@ impl<P: PinReader> ButtonInput for GenericGpioButton<P> {
     }
 }
 
-/// GPIO button for Raspberry Pi using rppal
+// =============================================================================
+// GPIO button for Raspberry Pi
+// =============================================================================
+
 #[cfg(target_os = "linux")]
 pub struct GpioButton {
     inner: GenericGpioButton<RppalPin>,
@@ -267,25 +458,42 @@ impl ButtonInput for GpioButton {
     }
 }
 
-/// Create appropriate button input based on platform
+// =============================================================================
+// Factory
+// =============================================================================
+
+/// Create appropriate button input based on platform.
+///
+/// On Linux: uses GPIO pin 17.
+/// On macOS: call `create_gui_button()` instead, which requires main-thread setup.
+#[cfg(target_os = "linux")]
 pub fn create_button() -> Box<dyn ButtonInput> {
-    #[cfg(target_os = "linux")]
-    {
-        // Try to create GPIO button (will fail on non-Pi Linux)
-        match GpioButton::new(17) {
-            Ok(button) => {
-                log::info!("Using GPIO button on pin 17");
-                return Box::new(button);
-            }
-            Err(e) => {
-                log::warn!("GPIO not available ({}), using keyboard input", e);
-            }
+    match GpioButton::new(17) {
+        Ok(button) => {
+            log::info!("Using GPIO button on pin 17");
+            Box::new(button)
+        }
+        Err(e) => {
+            panic!("GPIO not available: {}", e);
         }
     }
-
-    log::info!("Using keyboard input (Enter/Space = button, hold 2s for off)");
-    Box::new(KeyboardButton::new())
 }
+
+/// Create GUI button components for macOS/desktop.
+/// Returns a ButtonInput and a closure that must be run on the main thread (blocks forever).
+#[cfg(not(target_os = "linux"))]
+pub fn create_gui_button() -> (Box<dyn ButtonInput>, impl FnOnce()) {
+    let (pin_reader, pressed) = gui_button::create_gui_pin_reader();
+    let button = Box::new(gui_button::GuiButton::new(pin_reader));
+    let run_gui = move || {
+        gui_button::run_gui_window(pressed);
+    };
+    (button, run_gui)
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -317,11 +525,8 @@ mod tests {
         }
     }
 
-    // ==================== Configuration Tests ====================
-
     #[test]
     fn test_long_press_constant() {
-        // Long press threshold should be 2 seconds
         assert_eq!(LONG_PRESS_MS, 2000);
     }
 
@@ -345,79 +550,56 @@ mod tests {
         assert_ne!(ButtonEvent::Short, ButtonEvent::Long);
     }
 
-    // ==================== Button Press Behavior Tests ====================
-    // New behavior: immediate response, no debounce
-    // - Short press: detected on button release (before long threshold)
-    // - Long press: detected immediately when threshold reached (while still held)
-
     #[test]
     fn test_short_press_sends_down_then_short() {
-        // Short press: button down then released before long press threshold
-        // Should send Down, then Short
         let pin = MockPin::new(vec![
             PinLevel::Low,  // Button pressed - sends Down
             PinLevel::High, // Released quickly - sends Short
         ]);
-        let config = ButtonConfig::default();
-        let button = GenericGpioButton::new(pin, config);
+        let button = GenericGpioButton::new(pin, ButtonConfig::default());
 
         let (tx, rx) = std::sync::mpsc::channel();
         button.wait_for_press(&tx);
 
-        // Should receive Down first, then Short
         assert_eq!(rx.recv().unwrap(), ButtonEvent::Down);
         assert_eq!(rx.recv().unwrap(), ButtonEvent::Short);
     }
 
     #[test]
-    #[ignore] // Takes 2+ seconds - run with `cargo test -- --ignored`
+    #[ignore] // Takes 2+ seconds
     fn test_long_press_sends_down_then_long() {
-        // Long press: button held past threshold triggers immediately
-        // Should send Down, then Long as soon as threshold reached
         let pin = MockPin::new(vec![
-            PinLevel::Low, // Held... (will trigger Long after threshold)
+            PinLevel::Low, // Held forever → triggers Long after threshold
         ]);
-        let config = ButtonConfig {
-            poll_ms: 10, // Normal polling
-        };
-        let button = GenericGpioButton::new(pin, config);
+        let button = GenericGpioButton::new(pin, ButtonConfig { poll_ms: 10 });
 
         let (tx, rx) = std::sync::mpsc::channel();
         button.wait_for_press(&tx);
 
-        // Should receive Down first, then Long
         assert_eq!(rx.recv().unwrap(), ButtonEvent::Down);
         assert_eq!(rx.recv().unwrap(), ButtonEvent::Long);
     }
 
     #[test]
     fn test_multiple_short_presses() {
-        // Each press-release cycle should send Down+Short
         let pin = MockPin::new(vec![
-            // First press
-            PinLevel::Low,  // Press - sends Down
-            PinLevel::High, // Release - sends Short
-            // Second press
-            PinLevel::Low,  // Press - sends Down
-            PinLevel::High, // Release - sends Short
+            PinLevel::Low,
+            PinLevel::High,
+            PinLevel::Low,
+            PinLevel::High,
         ]);
-        let config = ButtonConfig::default();
-        let button = GenericGpioButton::new(pin, config);
+        let button = GenericGpioButton::new(pin, ButtonConfig::default());
 
         let (tx, rx) = std::sync::mpsc::channel();
 
-        // First press
         button.wait_for_press(&tx);
         assert_eq!(rx.recv().unwrap(), ButtonEvent::Down);
         assert_eq!(rx.recv().unwrap(), ButtonEvent::Short);
 
-        // Second press
         button.wait_for_press(&tx);
         assert_eq!(rx.recv().unwrap(), ButtonEvent::Down);
         assert_eq!(rx.recv().unwrap(), ButtonEvent::Short);
     }
-
-    // ==================== Mock Infrastructure Tests ====================
 
     #[test]
     fn test_mock_pin_returns_sequence() {
@@ -430,62 +612,9 @@ mod tests {
     }
 
     #[test]
-    fn test_keyboard_button_is_not_gpio() {
-        let button = KeyboardButton::new();
-        assert!(!button.is_gpio());
-    }
-
-    #[test]
     fn test_generic_gpio_button_is_gpio() {
         let pin = MockPin::new(vec![PinLevel::Low, PinLevel::High]);
-        let config = ButtonConfig::default();
-        let button = GenericGpioButton::new(pin, config);
+        let button = GenericGpioButton::new(pin, ButtonConfig::default());
         assert!(button.is_gpio());
     }
-
-    // ==================== Keyboard Simulation Tests ====================
-    // Note: KeyboardButton uses GenericGpioButton internally, so it shares
-    // the same press detection logic as GPIO. The tests above for
-    // GenericGpioButton also validate keyboard behavior.
-
-    #[test]
-    fn test_keyboard_pin_reader_held_state() {
-        use std::sync::atomic::Ordering;
-
-        let reader = KeyboardPinReader::new();
-
-        // Initially not held (High)
-        assert!(!reader.held.load(Ordering::SeqCst));
-
-        // Simulate key press by setting held flag
-        reader.held.store(true, Ordering::SeqCst);
-
-        // Should read Low while held (no clearing - persistent state)
-        assert_eq!(reader.read(), PinLevel::Low);
-        assert_eq!(reader.read(), PinLevel::Low); // Still Low
-
-        // Simulate key release
-        reader.held.store(false, Ordering::SeqCst);
-
-        // Should read High after release
-        assert_eq!(reader.read(), PinLevel::High);
-    }
-
-    #[test]
-    fn test_keyboard_uses_same_logic_as_gpio() {
-        // KeyboardButton wraps GenericGpioButton, ensuring identical behavior
-        let keyboard = KeyboardButton::new();
-        let mock_pin = MockPin::new(vec![PinLevel::Low, PinLevel::High]);
-        let gpio = GenericGpioButton::new(mock_pin, ButtonConfig::default());
-
-        // Both should report the same is_gpio status as expected
-        assert!(!keyboard.is_gpio()); // Keyboard reports false
-        assert!(gpio.is_gpio()); // GPIO reports true
-
-        // But both use the same GenericGpioButton::detect_press logic internally
-        // (verified by code structure, not runtime test)
-    }
-
-    // Note: test_long_press_triggers_while_held uses real wall-clock time (2 seconds).
-    // For faster CI, this test is marked #[ignore] - run with `cargo test -- --ignored`
 }

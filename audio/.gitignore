@@ -1,0 +1,2 @@
+# Generated TTS audio (regenerate via Docker, see Dockerfile audio-gen stage)
+*.raw

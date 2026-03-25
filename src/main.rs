@@ -96,7 +96,29 @@ fn main() -> Result<()> {
     }
 
     // Run the radio
-    run_radio()
+    // On macOS, GUI event loop must run on the main thread.
+    // Radio logic runs on a background thread.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let (button, run_gui) = button::create_gui_button();
+        info!("Using GUI button window (click = short press, hold = long press)");
+
+        std::thread::spawn(move || {
+            if let Err(e) = run_radio_with_button(button) {
+                error!("Radio error: {}", e);
+                std::process::exit(1);
+            }
+        });
+
+        run_gui(); // Blocks forever on main thread
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let button = button::create_button();
+        run_radio_with_button(button)
+    }
 }
 
 fn print_help() {
@@ -121,7 +143,7 @@ CONTROLS:
     Long press (2s): Jump to OFF state
 
     On Raspberry Pi: GPIO button on pin 17
-    On Mac/Desktop:  Enter/Space (works like physical button)
+    On Mac/Desktop:  GUI window (click and hold = button press)
 
 Channels cycle: Welcome → 1 → 2 → ... → N → OFF → Welcome
 "#,
@@ -129,7 +151,7 @@ Channels cycle: Welcome → 1 → 2 → ... → N → OFF → Welcome
     );
 }
 
-fn run_radio() -> Result<()> {
+fn run_radio_with_button(button: Box<dyn button::ButtonInput>) -> Result<()> {
     info!("lego-radio v{} starting", VERSION);
 
     sentry::add_breadcrumb(sentry::Breadcrumb {
@@ -139,17 +161,8 @@ fn run_radio() -> Result<()> {
         ..Default::default()
     });
 
-    // Initialize TTS (downloads piper and voice model if needed)
-    info!("Initializing TTS...");
-    let tts = tts::PiperTts::new()?;
-    sentry::add_breadcrumb(sentry::Breadcrumb {
-        category: Some("init".into()),
-        message: Some("TTS initialized".into()),
-        level: sentry::Level::Info,
-        ..Default::default()
-    });
+    info!("TTS: using embedded audio");
 
-    // Simple audio pipeline (connect on demand)
     let mut pipeline = audio::AudioPipeline::new()?;
 
     // Start metrics collection thread
@@ -161,10 +174,6 @@ fn run_radio() -> Result<()> {
 
     // Button input in background thread
     std::thread::spawn(move || {
-        let button = button::create_button();
-        if !button.is_gpio() {
-            info!("(Enter/Space = button, hold 2s for off)");
-        }
         loop {
             button.wait_for_press(&tx);
         }
@@ -175,7 +184,7 @@ fn run_radio() -> Result<()> {
     let num_channels = channels::CHANNELS.len();
 
     // Handle Welcome state on startup
-    handle_welcome(&mut pipeline, &tts);
+    handle_welcome(&mut pipeline);
 
     // Drain any button presses that happened during welcome
     while rx.try_recv().is_ok() {}
@@ -256,13 +265,13 @@ fn run_radio() -> Result<()> {
 
         match state {
             RadioState::Welcome => {
-                handle_welcome(&mut pipeline, &tts);
+                handle_welcome(&mut pipeline);
                 // Drain any presses during welcome
                 while rx.try_recv().is_ok() {}
             }
             RadioState::Playing(idx) => {
                 // Play channel with interrupt support
-                if let Some(event) = play_channel(&mut pipeline, &tts, idx, &rx) {
+                if let Some(event) = play_channel(&mut pipeline, idx, &rx) {
                     // Interrupted by button - handle the event
                     pipeline.stop();
 
@@ -289,7 +298,7 @@ fn run_radio() -> Result<()> {
             }
             RadioState::Off => {
                 info!("Radio OFF");
-                pipeline.announce("Radio off", &tts);
+                pipeline.announce("Radio off");
                 // Drain any presses during announcement
                 while rx.try_recv().is_ok() {}
             }
@@ -342,7 +351,6 @@ fn handle_button_down(
 /// Returns None if completed normally, Some(event) if interrupted by button
 fn play_channel(
     pipeline: &mut audio::AudioPipeline,
-    tts: &tts::PiperTts,
     idx: usize,
     rx: &Receiver<ButtonEvent>,
 ) -> Option<ButtonEvent> {
@@ -357,14 +365,8 @@ fn play_channel(
     });
 
     // Announce channel name (interruptible)
-    if let Some(event) = pipeline.announce_interruptible(channel.tts_name, tts, Some(rx)) {
+    if let Some(event) = pipeline.announce_interruptible(channel.tts_name, Some(rx)) {
         info!("Interrupted during channel name");
-        return Some(event);
-    }
-
-    // Announce connecting (interruptible)
-    if let Some(event) = pipeline.announce_interruptible("Connecting", tts, Some(rx)) {
-        info!("Interrupted during connecting");
         return Some(event);
     }
 
@@ -419,7 +421,7 @@ fn play_channel(
 
                 // Announce only after silent retries exhausted
                 if let Some(event) =
-                    pipeline.announce_interruptible("Connection lost. Reconnecting.", tts, Some(rx))
+                    pipeline.announce_interruptible("Connection lost. Reconnecting.", Some(rx))
                 {
                     info!("Interrupted during reconnect announcement");
                     return Some(event);
@@ -449,7 +451,7 @@ fn play_channel(
                     channel.name, retry_count
                 );
                 if let Some(event) =
-                    pipeline.announce_interruptible("Connection failed. Retrying.", tts, Some(rx))
+                    pipeline.announce_interruptible("Connection failed. Retrying.", Some(rx))
                 {
                     info!("Interrupted during retry announcement");
                     return Some(event);
@@ -480,10 +482,10 @@ fn play_channel(
 }
 
 /// Handle the Welcome state - greet, check for updates
-fn handle_welcome(pipeline: &mut audio::AudioPipeline, tts: &tts::PiperTts) {
+fn handle_welcome(pipeline: &mut audio::AudioPipeline) {
     info!("Welcome - checking for updates");
-    pipeline.announce("Hello!", tts);
-    pipeline.announce("Checking for updates.", tts);
+    pipeline.announce("Hello!");
+    pipeline.announce("Checking for updates.");
 
     match updater::check_for_update() {
         Some(version) => {
@@ -496,7 +498,7 @@ fn handle_welcome(pipeline: &mut audio::AudioPipeline, tts: &tts::PiperTts) {
                 ..Default::default()
             });
 
-            pipeline.announce("Update found. Installing.", tts);
+            pipeline.announce("Update found. Installing.");
 
             match updater::do_update_to(Some(&version)) {
                 Ok(()) => {
@@ -504,38 +506,37 @@ fn handle_welcome(pipeline: &mut audio::AudioPipeline, tts: &tts::PiperTts) {
                         &format!("Update successful: v{} -> v{}", VERSION, version),
                         sentry::Level::Info,
                     );
-                    pipeline.announce("Update complete. Restarting.", tts);
+                    pipeline.announce("Update complete. Restarting.");
                     std::thread::sleep(std::time::Duration::from_secs(2));
                     std::process::exit(0);
                 }
                 Err(e) => {
                     error!("Update failed: {}", e);
                     sentry::integrations::anyhow::capture_anyhow(&e);
-                    pipeline.announce("Update failed.", tts);
+                    pipeline.announce("Update failed.");
                 }
             }
         }
         None => {
             info!("No updates available");
-            pipeline.announce("Up to date.", tts);
+            pipeline.announce("Up to date.");
         }
     }
 
-    pipeline.announce("Ready.", tts);
+    pipeline.announce("Ready.");
 }
 
 fn test_tts() -> Result<()> {
-    println!("Testing TTS (downloading piper if needed)...");
+    println!("Testing embedded TTS audio...");
 
-    let tts = tts::PiperTts::new()?;
-    let mut pipeline = audio::AudioPipeline::new()?;
+    let pipeline = audio::AudioPipeline::new()?;
 
     for channel in channels::CHANNELS.iter() {
         println!("  Speaking: {}", channel.tts_name);
-        pipeline.announce(channel.tts_name, &tts);
+        pipeline.announce(channel.tts_name);
     }
 
-    pipeline.announce("Radio off", &tts);
+    pipeline.announce("Radio off");
 
     println!("TTS test complete!");
     Ok(())

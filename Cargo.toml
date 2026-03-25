@@ -12,10 +12,6 @@ symphonia = { version = "0.5", features = ["mp3", "aac", "isomp4", "wav", "pcm"]
 # Audio output - use 0.17 to match fliters dependency
 rodio = { version = "0.17", default-features = false, features = ["symphonia-all"] }
 
-# Archive extraction for piper download
-flate2 = "1"
-tar = "0.4"
-
 # HTTP client (blocking, simple)
 ureq = { version = "2", features = ["json"] }
 
@@ -40,14 +36,21 @@ sentry = { version = "0.47", default-features = false, features = [
     "rustls",
 ] }
 
-# Terminal input (for testing without GPIO)
-crossterm = "0.28"
 m3u8-rs = "6.0.0"
 mpeg2ts-reader = "0.18.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # GPIO for Raspberry Pi (only on Linux)
 rppal = "0.19"
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+# GUI button for testing without GPIO
+winit = "0.30"
+softbuffer = "0.4"
+
+[build-dependencies]
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
 
 [profile.release]
 opt-level = "z"     # Optimize for size

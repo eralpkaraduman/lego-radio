@@ -1,0 +1,152 @@
+output_dir = "audio"
+
+# YLE channels (Finnish voice)
+[[channels]]
+name = "YLE Klassinen"
+url = "https://icecast.live.yle.fi/radio/YleKlassinen/icecast.audio"
+text = "YLE Klassinen"
+voice = "fi_FI-asmo-medium"
+file = "yle_classical"
+
+[[channels]]
+name = "YLE Radio 1"
+url = "https://icecast.live.yle.fi/radio/YleRadio1/icecast.audio"
+text = "YLE Radio 1"
+voice = "fi_FI-asmo-medium"
+file = "yle_radio_1"
+
+[[channels]]
+name = "YLE Radio Suomi"
+url = "https://icecast.live.yle.fi/radio/YleRS/icecast.audio"
+text = "YLE Radio Suomi"
+voice = "fi_FI-asmo-medium"
+file = "yle_radio_suomi"
+
+[[channels]]
+name = "YleX"
+url = "https://icecast.live.yle.fi/radio/YleX/icecast.audio"
+text = "YLE-X"
+voice = "fi_FI-asmo-medium"
+file = "yle_x"
+
+# Soma FM channels
+[[channels]]
+name = "Soma FM Groove Salad"
+url = "https://ice1.somafm.com/groovesalad-128-mp3"
+text = "Soma Groove Salad"
+voice = "en_GB-alan-medium"
+file = "soma_groove_salad"
+
+[[channels]]
+name = "Soma FM Indie Pop"
+url = "https://ice1.somafm.com/indiepop-128-mp3"
+text = "Soma Indie Pop Rocks"
+voice = "en_GB-alan-medium"
+file = "soma_indie_pop_rocks"
+
+[[channels]]
+name = "Soma FM Secret Agent"
+url = "https://ice1.somafm.com/secretagent-128-mp3"
+text = "Soma Secret Agent"
+voice = "en_GB-alan-medium"
+file = "soma_secret_agent"
+
+# Radyo Eksen (Turkish voice)
+[[channels]]
+name = "Radyo Eksen"
+url = "http://eksenwmp.radyotvonline.com/;stream.mp3"
+text = "Radyo Eksen"
+voice = "tr_TR-dfki-medium"
+file = "radyo_eksen"
+
+# BBC channels
+[[channels]]
+name = "BBC World Service"
+url = "http://stream.live.vc.bbcmedia.co.uk/bbc_world_service"
+text = "B B C World Service"
+voice = "en_GB-alan-medium"
+file = "bbc_world_service"
+
+[[channels]]
+name = "BBC Radio 1"
+url = "http://as-hls-ww-live.akamaized.net/pool_01505109/live/ww/bbc_radio_one/bbc_radio_one.isml/bbc_radio_one-audio=96000.norewind.m3u8"
+text = "B B C Radio 1"
+voice = "en_GB-alan-medium"
+file = "bbc_radio_1"
+
+[[channels]]
+name = "BBC Radio 2"
+url = "http://as-hls-ww-live.akamaized.net/pool_74208725/live/ww/bbc_radio_two/bbc_radio_two.isml/bbc_radio_two-audio=96000.norewind.m3u8"
+text = "B B C Radio 2"
+voice = "en_GB-alan-medium"
+file = "bbc_radio_2"
+
+[[channels]]
+name = "BBC Radio 3"
+url = "http://as-hls-ww-live.akamaized.net/pool_23461179/live/ww/bbc_radio_three/bbc_radio_three.isml/bbc_radio_three-audio=96000.norewind.m3u8"
+text = "B B C Radio 3"
+voice = "en_GB-alan-medium"
+file = "bbc_radio_3"
+
+[[channels]]
+name = "BBC Radio 4"
+url = "http://as-hls-ww-live.akamaized.net/pool_55057080/live/ww/bbc_radio_fourfm/bbc_radio_fourfm.isml/bbc_radio_fourfm-audio=128000.norewind.m3u8"
+text = "B B C Radio 4"
+voice = "en_GB-alan-medium"
+file = "bbc_radio_4"
+
+# System UI phrases
+[[ui]]
+text = "Hello!"
+voice = "en_GB-alan-medium"
+file = "hello"
+
+[[ui]]
+text = "Checking for updates."
+voice = "en_GB-alan-medium"
+file = "checking_for_updates"
+
+[[ui]]
+text = "Update found. Installing."
+voice = "en_GB-alan-medium"
+file = "update_found_installing"
+
+[[ui]]
+text = "Update complete. Restarting."
+voice = "en_GB-alan-medium"
+file = "update_complete_restarting"
+
+[[ui]]
+text = "Update failed."
+voice = "en_GB-alan-medium"
+file = "update_failed"
+
+[[ui]]
+text = "Up to date."
+voice = "en_GB-alan-medium"
+file = "up_to_date"
+
+[[ui]]
+text = "Ready."
+voice = "en_GB-alan-medium"
+file = "ready"
+
+[[ui]]
+text = "Connection lost. Reconnecting."
+voice = "en_GB-alan-medium"
+file = "connection_lost_reconnecting"
+
+[[ui]]
+text = "Connection failed. Retrying."
+voice = "en_GB-alan-medium"
+file = "connection_failed_retrying"
+
+[[ui]]
+text = "Radio off"
+voice = "en_GB-alan-medium"
+file = "radio_off"
+
+[[ui]]
+text = "Off"
+voice = "en_GB-alan-medium"
+file = "off"
