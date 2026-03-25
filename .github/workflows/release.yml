@@ -114,11 +114,16 @@ jobs:
             type=gha,scope=build-arm64
           cache-to: type=gha,mode=min,scope=build-arm64
 
+      - name: Generate checksum
+        run: sha256sum out/lego-radio-arm64 > out/lego-radio-arm64.sha256
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: lego-radio-arm64
-          path: out/lego-radio-arm64
+          path: |
+            out/lego-radio-arm64
+            out/lego-radio-arm64.sha256
 
   release:
     needs: [check-version, build]
@@ -148,5 +153,7 @@ jobs:
         with:
           tag_name: v${{ needs.check-version.outputs.version }}
           name: v${{ needs.check-version.outputs.version }}
-          files: lego-radio-arm64
+          files: |
+            lego-radio-arm64
+            lego-radio-arm64.sha256
           generate_release_notes: true

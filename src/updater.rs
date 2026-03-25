@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Result};
-use log::{debug, info};
+use log::{debug, info, warn};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -81,6 +82,37 @@ pub fn do_update_to(version: Option<&str>) -> Result<()> {
     std::io::copy(&mut reader, &mut file)?;
     file.flush()?;
 
+    // Verify SHA256 checksum (if available)
+    let checksum_url = format!("{}.sha256", url);
+    match ureq::get(&checksum_url)
+        .set("User-Agent", "lego-radio")
+        .call()
+    {
+        Ok(resp) => {
+            let mut checksum_body = String::new();
+            resp.into_reader()
+                .read_to_string(&mut checksum_body)
+                .map_err(|e| anyhow!("Failed to read checksum: {}", e))?;
+            let expected = checksum_body.split_whitespace().next().unwrap_or("");
+
+            let binary_data = fs::read(tmp_path)?;
+            let actual = format!("{:x}", Sha256::digest(&binary_data));
+
+            if actual != expected {
+                fs::remove_file(tmp_path)?;
+                return Err(anyhow!(
+                    "Checksum mismatch: expected {} got {}",
+                    expected,
+                    actual
+                ));
+            }
+            info!("Checksum verified: {}", actual);
+        }
+        Err(_) => {
+            warn!("No checksum file available, skipping verification");
+        }
+    }
+
     // Make executable
     #[cfg(unix)]
     {
@@ -134,9 +166,6 @@ pub fn do_update() -> Result<()> {
 fn get_binary_name(os: &str, arch: &str) -> Option<&'static str> {
     match (os, arch) {
         ("linux", "aarch64") => Some("lego-radio-arm64"),
-        ("linux", "x86_64") => Some("lego-radio-x86_64"),
-        ("macos", "aarch64") => Some("lego-radio-darwin-arm64"),
-        ("macos", "x86_64") => Some("lego-radio-darwin-x86_64"),
         _ => None,
     }
 }
@@ -228,40 +257,11 @@ mod tests {
             get_binary_name("linux", "aarch64"),
             Some("lego-radio-arm64")
         );
-        assert_eq!(
-            get_binary_name("linux", "x86_64"),
-            Some("lego-radio-x86_64")
-        );
-        assert_eq!(
-            get_binary_name("macos", "aarch64"),
-            Some("lego-radio-darwin-arm64")
-        );
-        assert_eq!(
-            get_binary_name("macos", "x86_64"),
-            Some("lego-radio-darwin-x86_64")
-        );
 
-        // Test unsupported platforms return None
+        // Only arm64 Linux is supported
+        assert_eq!(get_binary_name("linux", "x86_64"), None);
+        assert_eq!(get_binary_name("macos", "aarch64"), None);
         assert_eq!(get_binary_name("windows", "x86_64"), None);
-        assert_eq!(get_binary_name("linux", "armv7"), None);
-        assert_eq!(get_binary_name("freebsd", "aarch64"), None);
-    }
-
-    #[test]
-    fn test_current_platform_supported() {
-        let os = std::env::consts::OS;
-        let arch = std::env::consts::ARCH;
-
-        let supported = matches!(
-            (os, arch),
-            ("linux", "aarch64") | ("linux", "x86_64") | ("macos", "aarch64") | ("macos", "x86_64")
-        );
-
-        assert!(
-            supported,
-            "Current platform {}-{} should be supported",
-            os, arch
-        );
     }
 
     // =============================================================================

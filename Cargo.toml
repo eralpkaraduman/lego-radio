@@ -1,6 +1,6 @@
 [package]
 name = "lego-radio"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 description = "A LEGO-based internet radio with single button control"
 license = "MIT"
@@ -35,6 +35,9 @@ sentry = { version = "0.47", default-features = false, features = [
     "reqwest",
     "rustls",
 ] }
+
+# Checksum verification for updates
+sha2 = "0.10"
 
 m3u8-rs = "6.0.0"
 mpeg2ts-reader = "0.18.2"
