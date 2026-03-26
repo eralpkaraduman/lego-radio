@@ -1,54 +1,67 @@
 # LEGO Radio
 
-A LEGO-based internet radio with channel switch control, powered by Raspberry Pi.
+A LEGO-based internet radio with single button control, powered by Raspberry Pi.
 
 ## Features
 
-- Channel switch cycles through radio stations
-- Text-to-speech announces each channel (interruptible)
-- Instant beep feedback on input
-- Auto-reconnect on connection loss
-- Self-updating binary
+- Browse-then-commit channel switching with TTS announcements
+- Stream ducks to 20% while browsing, switches only on commit
+- Per-language TTS voices (Finnish, Turkish, English) via Piper
+- Instant beep feedback on press, confirm blip on release
+- Auto-reconnect with exponential backoff
+- Self-updating binary with SHA256 checksum verification
 - Runs as a systemd service
 
-## Architecture
+## How It Works
 
-Simple state machine: `Welcome → Channel 1 → ... → Channel N → Off → (repeat)`
+**On power-on:**
+1. "Hello!" → checks for updates → announces first channel → starts playing
 
-**Connect-on-demand design:**
-- One stream at a time (no pre-buffering)
-- Input → immediate beep → stop current stream → announce next channel → connect
-- TTS is interruptible - switch again to skip to next state
-- Auto-reconnects if stream drops (30s retry interval)
-- Minimal resource usage in Off state
+**Short press:** Enter browse mode
+- Stream keeps playing (ducked to 20%)
+- TTS announces next channel
+- Press again to advance, channels wrap around
+- Stop pressing → TTS finishes + 0.5s → channel commits and switches
+
+**Long press (2s):** Turn off
+- "Radio off" → idle, waiting for next press
+
+**From off:** Short press → full startup sequence → first channel
+
+## Configuration
+
+Everything is configured in `radio.toml`:
+
+```toml
+[[channels]]
+name = "YLE Klassinen"
+url = "https://icecast.live.yle.fi/radio/YleKlassinen/icecast.audio"
+text = "YLE Klassinen"
+voice = "fi_FI-asmo-medium"
+file = "yle_classical"
+
+[[ui]]
+text = "Hello!"
+voice = "en_GB-alan-medium"
+file = "hello"
+```
+
+- **Channels:** name, stream URL, TTS text, Piper voice model, audio filename
+- **UI phrases:** system announcements (hello, update status, radio off, etc.)
+- Adding a channel = add a `[[channels]]` entry and rebuild
 
 ## Hardware
 
-- Raspberry Pi 4 (or 3B+)
+- Raspberry Pi 4B
 - [Audio Amp SHIM](https://shop.pimoroni.com/products/audio-amp-shim-3w-mono-amp) (3W mono I2S amp)
-- Momentary switch (LEGO channel dial actuates this)
+- Momentary switch on GPIO 17 (LEGO channel dial actuates this)
 - 4-8Ω speaker (3W or less)
 
 ### Wiring
 
 ```
-Switch wiring (uses internal pull-up resistor):
-
-    GPIO 17 (pin 11) ──────┤ ├────── GND (pin 9)
-                          Switch
-
-Pin layout:
-    ┌─────────────────────────────┐
-    │ (1)  (2)                    │
-    │  ○    ○   ...               │
-    │ (3)  (4)                    │
-    │  ○    ○   ...               │
-    │  ...                        │
-    │ (9)  (10)                   │
-    │ GND   ○   ...               │
-    │(11) (12)                    │
-    │GPIO17 ○   ...               │
-    └─────────────────────────────┘
+GPIO 17 (pin 11) ──────┤ ├────── GND (pin 9)
+                       Switch
 ```
 
 ## Installation
@@ -59,93 +72,74 @@ Pin layout:
 curl -sL https://raw.githubusercontent.com/eralpkaraduman/lego-radio/main/install.sh | sudo bash
 ```
 
-The installer configures I2S audio, installs dependencies, and sets up the service. **Reboot required after install.**
-
-## Usage
-
-On power-on, the radio automatically:
-1. Says "Hello! Checking for updates..."
-2. Auto-updates if available
-3. Says "Ready" and waits
-
-Switch to:
-- Cycle through channels (1 → 2 → ... → N → Off → Welcome)
-- Skip TTS announcements
-- Interrupt reconnection attempts
-
-## Commands
-
-```bash
-# Check status
-sudo systemctl status lego-radio
-
-# View logs
-sudo journalctl -u lego-radio -f
-
-# Restart
-sudo systemctl restart lego-radio
-```
+The installer configures I2S audio, installs dependencies, and sets up the service. Reboot required after install.
 
 ## Development
 
-### macOS Setup (Required)
+### Prerequisites
 
-On macOS, TTS requires Docker with a Piper container. **This must be set up before running the app.**
+- [Docker](https://docker.com) (for building)
+- [Rust](https://rustup.rs) (optional, for local dev)
 
-1. **Install Docker Desktop** from https://docker.com
+### Build Release Binary
 
-2. **Build the Piper Docker image:**
-   ```bash
-   docker build -f Dockerfile.piper -t lego-radio-piper .
-   ```
-
-3. **Verify it works:**
-   ```bash
-   cargo run -- --test-tts
-   ```
-
-The voice model (~63MB) will be downloaded automatically on first run to `~/.local/share/lego-radio/`.
-
-### Changing the Voice
-
-Edit `src/tts.rs` to change the Piper voice:
-
-```rust
-// Voice Configuration
-const VOICE_MODEL: &str = "en_GB-alan-medium";
-const VOICE_BASE_URL: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/alan/medium";
-```
-
-Browse available voices at: https://huggingface.co/rhasspy/piper-voices/tree/main/en
-
-After changing, delete the old model and restart:
-```bash
-rm ~/.local/share/lego-radio/*.onnx*
-cargo run -- --test-tts
-```
-
-### Running Locally
+Single command builds everything (TTS audio generation + cross-compilation):
 
 ```bash
-# Run the radio (press Enter to cycle channels)
+docker build --output=out .
+# Binary: out/lego-radio-arm64
+```
+
+### Local Development (macOS)
+
+```bash
+# Generate TTS audio files (first time / after changing radio.toml)
+docker build --target audio-gen -t lego-radio-audio .
+docker run --rm -v ./audio:/output lego-radio-audio cp -r /audio/. /output/
+
+# Run locally (opens a GUI button window for input)
 cargo run
 
-# Test TTS only
+# Test TTS playback
 cargo run -- --test-tts
 
-# Test a single stream
+# Test a stream
 cargo run -- --test-stream
 ```
 
-### Editing Channels
+On macOS, a small GUI window appears with a red button for input:
+- Click = short press (browse channels)
+- Click and hold 2s = long press (turn off)
 
-Edit `src/channels.rs` to change radio stations. Bump version in `Cargo.toml` and push to trigger a new release.
+### Audio Architecture
 
-### Cross-Compiling for Raspberry Pi
+Three independent audio sinks:
+- **Stream sink:** radio playback, volume duckable during browse
+- **Voice sink:** TTS announcements, interruptible
+- **Beep sink:** button feedback sounds
+
+Stream threads use an epoch counter to prevent stale audio after channel switches.
+
+### Adding/Changing Channels
+
+1. Edit `radio.toml` — add a `[[channels]]` entry
+2. Rebuild: `docker build --output=out .`
+3. Audio files are auto-generated from the `text` and `voice` fields
+
+### Changing Voices
+
+Per-phrase voice selection in `radio.toml`. Available voices:
+- `en_GB-alan-medium` — English (default)
+- `fi_FI-asmo-medium` — Finnish ([AsmoKoskinen/Piper_Finnish_Model](https://huggingface.co/AsmoKoskinen/Piper_Finnish_Model))
+- `tr_TR-dfki-medium` — Turkish
+- Browse more at [rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices)
+
+### Service Management
 
 ```bash
-# Build (requires Docker)
-./scripts/dev.sh build
+sudo systemctl status lego-radio
+sudo journalctl -u lego-radio -f
+sudo systemctl restart lego-radio
 ```
 
 ## License
